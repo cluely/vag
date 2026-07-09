@@ -169,7 +169,7 @@ pub fn machine_collapse_key(name: &str) -> String {
 }
 
 /// Build visible rows. `provisional` = open runtimes with no scan entry yet
-/// (they render as "(starting…)" and must never disappear while open).
+/// (requested/state labels when known, otherwise "(starting…)").
 /// `machines` = configured `[[remotes]]` as (name, host); each gets an
 /// always-visible group (scope-exempt like remote sessions) holding that
 /// machine's unfoldered remote sessions.
@@ -190,7 +190,7 @@ pub fn build_rows(
     // filter mode: flat list of matching sessions, no folders
     if let Some(q) = filter {
         let q = q.to_lowercase();
-        return sessions
+        let mut rows: Vec<Row> = sessions
             .iter()
             .enumerate()
             .filter(|(_, m)| visible(state, m, show_hidden, show_archived, scope))
@@ -205,6 +205,15 @@ pub fn build_rows(
                 meta_idx: Some(i),
             })
             .collect();
+        // Open meta-less panes are reachability handles, not ordinary search
+        // results. Keep them visible under any filter until discovery gives
+        // them searchable metadata.
+        rows.extend(provisional.iter().cloned().map(|key| Row::Session {
+            key,
+            depth: 0,
+            meta_idx: None,
+        }));
+        return rows;
     }
 
     // group session indices by folder id (validated against existing
@@ -439,14 +448,29 @@ fn count_recursive(
 }
 
 pub fn display_title(state: &VagState, m: &SessionMeta) -> String {
-    if let Some(n) = state
-        .session(&m.key)
-        .and_then(|r| r.name_override.as_deref())
-        && !n.trim().is_empty()
-    {
-        return n.trim().to_string();
+    if let Some(name) = state_name(state, &m.key) {
+        return name;
     }
     m.display_title()
+}
+
+/// Vag-owned name for rows that may not have a SessionMeta yet (fresh known
+/// ids, early SQLite resolution, and remote synthetic sessions).
+pub fn state_name(state: &VagState, key: &SessionKey) -> Option<String> {
+    state
+        .session(key)
+        .and_then(|r| r.name_override.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+pub fn meta_less_title(key: &SessionKey) -> String {
+    if key.id.starts_with("pending-") {
+        "(starting…)".to_string()
+    } else {
+        format!("{} session", key.agent.label())
+    }
 }
 
 pub fn rel_time(t: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
@@ -508,8 +532,8 @@ pub struct RowCtx<'a> {
     pub spin_frame: usize,
     /// Resolved glyph set (ascii/nerd), chosen once by the app from config.
     pub icons: &'a Icons,
-    /// Display titles for provisional runtimes with no scan entry (shell
-    /// panes: "shell @ gpu" / "shell: proj"); fallback is "(starting…)".
+    /// Display titles for provisional runtimes with no scan entry (requested
+    /// agent names or shell labels); fallback is "(starting…)".
     pub provisional_labels: &'a HashMap<SessionKey, String>,
     /// Active color theme: ALL chrome text in the tree (buttons, folder
     /// names, project labels, timestamps, highlights) keys off this — never
@@ -553,10 +577,9 @@ fn session_line(
             )
         }
         None => (
-            ctx.provisional_labels
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| "(starting…)".to_string()),
+            state_name(ctx.state, key)
+                .or_else(|| ctx.provisional_labels.get(key).cloned())
+                .unwrap_or_else(|| meta_less_title(key)),
             String::new(),
             String::new(),
             false,
@@ -1181,6 +1204,7 @@ mod tests {
     #[test]
     fn filter_flattens_and_matches() {
         let st = VagState::default();
+        let pending = SessionKey::new(AgentKind::Codex, "pending-open");
         let sessions = vec![
             meta(AgentKind::Claude, "aaa", "fix auth bug"),
             meta(AgentKind::Codex, "bbb", "write docs"),
@@ -1188,7 +1212,7 @@ mod tests {
         let rows = build_rows(
             &st,
             &sessions,
-            &[],
+            std::slice::from_ref(&pending),
             &[],
             &HashSet::new(),
             Some("auth"),
@@ -1196,8 +1220,9 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0], Row::Session { key, .. } if key.id == "aaa"));
+        assert!(matches!(&rows[1], Row::Session { key, meta_idx: None, .. } if key == &pending));
     }
 
     #[test]
@@ -1607,8 +1632,10 @@ mod tests {
 
     #[test]
     fn provisional_labels_replace_the_starting_placeholder() {
-        let st = VagState::default();
+        let mut st = VagState::default();
         let key = SessionKey::new(AgentKind::Shell, "shell-abc123");
+        let resolved = SessionKey::new(AgentKind::Codex, "real-id");
+        st.session_mut(&resolved).name_override = Some("named early".into());
         let badges = HashMap::new();
         let mut labels = HashMap::new();
         labels.insert(key.clone(), "shell @ gpu".to_string());
@@ -1631,6 +1658,11 @@ mod tests {
         let other = SessionKey::new(AgentKind::Codex, "pending-xyz");
         let t = line_text(&session_line(&ctx, &other, None, 1, false, 80));
         assert!(t.contains("(starting…)"), "{t:?}");
+        let t = line_text(&session_line(&ctx, &resolved, None, 1, false, 80));
+        assert!(t.contains("named early"), "{t:?}");
+        let unnamed = SessionKey::new(AgentKind::Codex, "real-unnamed");
+        let t = line_text(&session_line(&ctx, &unnamed, None, 1, false, 80));
+        assert!(t.contains("codex session"), "{t:?}");
     }
 
     #[test]

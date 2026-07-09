@@ -13,14 +13,16 @@
 //!   error).
 //! - Claude new sessions pre-assign a uuid via `--session-id` so the folder
 //!   mapping can be written before the CLI even starts. Codex has no such
-//!   flag: the id is discovered post-spawn by watching for the new rollout.
+//!   flag: its id is discovered from the early SQLite row, with a rollout
+//!   watcher as compatibility fallback.
 //! - Fork: claude `--resume <id> --fork-session` (new id discovered via the
 //!   live-process registry keyed by our child pid); codex `fork <uuid>`
-//!   (UUID-only subcommand; new id via rollout watch).
+//!   (UUID-only subcommand; new id via SQLite/rollout discovery).
 //! - Env: children get TERM=xterm-256color and COLORTERM=truecolor
 //!   overrides (matching what the embedded emulator implements); the rest of
 //!   the parent env is inherited by the runtime layer.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -43,12 +45,15 @@ pub struct SpawnSpec {
 pub enum PendingId {
     /// Claude: id pre-assigned via --session-id.
     Known(String),
-    /// Codex: watch for a new rollout (see discover_codex_session_id).
+    /// Codex: discover the id after spawn (SQLite first, rollout fallback).
     Discover,
 }
 
 const CLAUDE_REGISTRY_POLL: Duration = Duration::from_millis(100);
 const CODEX_ROLLOUT_POLL: Duration = Duration::from_millis(200);
+/// A new thread's own session timestamp should be close to process spawn,
+/// even when its SQLite insert or rollout materialization is delayed.
+pub const CODEX_ID_START_WINDOW: Duration = Duration::from_secs(120);
 /// Rollout files stamped up to this long before `spawned_after` still count
 /// (clock slack between our SystemTime sample and the fs timestamp).
 const MTIME_SLACK: Duration = Duration::from_secs(2);
@@ -271,43 +276,90 @@ fn registry_session_id(path: &Path) -> Option<String> {
     }
 }
 
-/// Poll `<codex_home>/sessions/` for a rollout file CREATED after
-/// `spawned_after` whose session_meta.cwd == `cwd`. Newest match wins.
-/// Returns None after `deadline`. Must be cheap: only stat/glob today's
-/// (and, around midnight, yesterday's) date dirs, and read only line 1 of
-/// candidates. Newness is judged by the file's creation time (mtime only
-/// where the fs reports no birth time): rollouts are append-in-place, so an
-/// already-running session in the same cwd always has a fresh mtime and
-/// would otherwise be mis-attributed to the new child.
+/// Resolve a newly launched Codex thread. The SQLite index is checked first:
+/// recent Codex versions insert the thread there before lazily creating its
+/// rollout. The rollout walk remains the compatibility fallback. Returns
+/// None after `deadline`; callers may retry with the original spawn time.
+#[cfg(test)]
 pub fn discover_codex_session_id(
     cfg: &Config,
     cwd: &Path,
     spawned_after: SystemTime,
     deadline: Duration,
 ) -> Option<String> {
+    discover_codex_session_id_excluding(cfg, cwd, spawned_after, deadline, &HashSet::new())
+}
+
+/// Same resolver with ids that are already claimed by another live runtime.
+/// Collision retries use this to advance to the next eligible SQLite/rollout
+/// candidate instead of returning the same id forever.
+pub fn discover_codex_session_id_excluding(
+    cfg: &Config,
+    cwd: &Path,
+    spawned_after: SystemTime,
+    deadline: Duration,
+    excluded_ids: &HashSet<String>,
+) -> Option<String> {
     let root = cfg.codex_home().join("sessions");
+    let spawned_before = spawned_after
+        .checked_add(CODEX_ID_START_WINDOW)
+        .unwrap_or(spawned_after);
     let target_forms = cwd_match_forms(cwd);
-    let min_created = spawned_after
-        .checked_sub(MTIME_SLACK)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    // This boundary is sampled before process spawn, so no backwards slack
+    // is needed (and admitting pre-launch files can steal an old session).
+    let min_created = spawned_after;
     // Skip date dirs older than 2 days: "YYYY/MM/DD" sorts lexicographically.
     let cutoff = chrono::Local::now()
         .date_naive()
         .checked_sub_days(chrono::Days::new(2))
         .map(|d| d.format("%Y/%m/%d").to_string())
         .unwrap_or_default();
+    let mut last_index_check: Option<Instant> = None;
+    let mut index_checks = 0_u32;
     poll_until(deadline, CODEX_ROLLOUT_POLL, || {
-        scan_rollouts_once(&root, &cutoff, &target_forms, min_created).map(|(_, id)| id)
+        // Snapshotting a live WAL database is intentionally safer than a
+        // direct open, but not free. Check twice around the startup race,
+        // then back off while the cheap rollout walk keeps polling.
+        let index_interval = if index_checks < 2 {
+            Duration::from_millis(400)
+        } else {
+            Duration::from_secs(5)
+        };
+        if last_index_check.is_none_or(|last| last.elapsed() >= index_interval) {
+            last_index_check = Some(Instant::now());
+            index_checks += 1;
+            if let Ok(Some(id)) = crate::discovery::codex::find_new_cli_thread_id(
+                cfg,
+                cwd,
+                spawned_after,
+                spawned_before,
+                excluded_ids,
+            ) {
+                return Some(id);
+            }
+        }
+        scan_rollouts_once(
+            &root,
+            &cutoff,
+            &target_forms,
+            min_created,
+            spawned_before,
+            excluded_ids,
+        )
+        .map(|(_, id)| id)
     })
 }
 
-/// One pass over recent date dirs; returns (mtime, id) of the newest
-/// matching rollout, if any.
+/// One pass over recent date dirs; returns the earliest eligible session
+/// start after the launch boundary. Collision retries exclude claimed ids
+/// and advance to the next candidate.
 fn scan_rollouts_once(
     root: &Path,
     cutoff: &str,
     target_forms: &[String],
     min_created: SystemTime,
+    max_started: SystemTime,
+    excluded_ids: &HashSet<String>,
 ) -> Option<(SystemTime, String)> {
     let mut best: Option<(SystemTime, String)> = None;
     let cutoff_year = cutoff.get(..4).unwrap_or("");
@@ -320,7 +372,14 @@ fn scan_rollouts_once(
                 if format!("{year}/{month}/{day}").as_str() < cutoff {
                     continue;
                 }
-                scan_day_dir(&day_path, target_forms, min_created, &mut best);
+                scan_day_dir(
+                    &day_path,
+                    target_forms,
+                    min_created,
+                    max_started,
+                    excluded_ids,
+                    &mut best,
+                );
             }
         }
     }
@@ -331,6 +390,8 @@ fn scan_day_dir(
     dir: &Path,
     target_forms: &[String],
     min_created: SystemTime,
+    max_started: SystemTime,
+    excluded_ids: &HashSet<String>,
     best: &mut Option<(SystemTime, String)>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -353,20 +414,30 @@ fn scan_day_dir(
         // a pre-existing session's rollout gets a fresh mtime on every
         // append, but only a file created after our spawn can belong to the
         // new child. mtime is the fallback where created() is unsupported.
-        if md.created().unwrap_or(mtime) < min_created {
+        if !system_time_at_or_after(md.created().unwrap_or(mtime), min_created) {
             continue;
         }
         let Some(line) = read_first_line(&entry.path()) else {
             continue;
         };
-        let Some((cand_cwd, id)) = parse_session_meta_line(&line) else {
+        let Some((cand_cwd, id, session_started)) = parse_session_meta_line(&line) else {
             continue;
         };
+        if excluded_ids.contains(&id) {
+            continue;
+        }
         if !cwd_matches(&cand_cwd, target_forms) {
             continue;
         }
-        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-            *best = Some((mtime, id));
+        let start_marker = session_started.unwrap_or_else(|| md.created().unwrap_or(mtime));
+        if !system_time_in_window(start_marker, min_created, max_started) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(started, _)| start_marker < *started)
+        {
+            *best = Some((start_marker, id));
         }
     }
 }
@@ -403,7 +474,7 @@ fn read_first_line(path: &Path) -> Option<String> {
 
 /// Extract (cwd, id) from a rollout's session_meta line; defensive — any
 /// missing piece → None.
-fn parse_session_meta_line(line: &str) -> Option<(String, String)> {
+fn parse_session_meta_line(line: &str) -> Option<(String, String, Option<SystemTime>)> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
@@ -417,7 +488,40 @@ fn parse_session_meta_line(line: &str) -> Option<(String, String)> {
     if id.is_empty() {
         None
     } else {
-        Some((cwd, id.to_string()))
+        let timestamp = payload
+            .get("timestamp")
+            .or_else(|| v.get("timestamp"))
+            .and_then(|t| t.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| SystemTime::from(t.with_timezone(&chrono::Utc)));
+        Some((cwd, id.to_string(), timestamp))
+    }
+}
+
+/// Whole-second legacy timestamps compare at second precision; modern
+/// subsecond timestamps use the exact launch boundary.
+fn system_time_in_window(candidate: SystemTime, start: SystemTime, end: SystemTime) -> bool {
+    let epoch = |time: SystemTime| time.duration_since(SystemTime::UNIX_EPOCH).ok();
+    let (Some(candidate), Some(start), Some(end)) = (epoch(candidate), epoch(start), epoch(end))
+    else {
+        return false;
+    };
+    if candidate.subsec_nanos() == 0 {
+        candidate.as_secs() >= start.as_secs() && candidate.as_secs() <= end.as_secs()
+    } else {
+        candidate >= start && candidate <= end
+    }
+}
+
+fn system_time_at_or_after(candidate: SystemTime, start: SystemTime) -> bool {
+    let epoch = |time: SystemTime| time.duration_since(SystemTime::UNIX_EPOCH).ok();
+    let (Some(candidate), Some(start)) = (epoch(candidate), epoch(start)) else {
+        return false;
+    };
+    if candidate.subsec_nanos() == 0 {
+        candidate.as_secs() >= start.as_secs()
+    } else {
+        candidate >= start
     }
 }
 
@@ -1097,7 +1201,6 @@ mod tests {
         std::fs::create_dir_all(day_dir).unwrap();
         let path = day_dir.join(file);
         let line1 = serde_json::json!({
-            "timestamp": "2026-07-08T10:00:00.000Z",
             "type": "session_meta",
             "payload": {"id": id, "session_id": id, "cwd": cwd, "cli_version": "0.142.5"}
         });
@@ -1120,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_codex_matches_cwd_and_picks_newest() {
+    fn discover_codex_matches_cwd_and_picks_first_after_launch() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_cfg(tmp.path(), tmp.path());
         let target = tmp.path().join("proj");
@@ -1169,6 +1272,14 @@ mod tests {
 
         let got =
             discover_codex_session_id(&cfg, &target, spawned_after, Duration::from_millis(100));
+        assert_eq!(got.as_deref(), Some("id-older"));
+        let got = discover_codex_session_id_excluding(
+            &cfg,
+            &target,
+            spawned_after,
+            Duration::from_millis(100),
+            &HashSet::from(["id-older".to_string()]),
+        );
         assert_eq!(got.as_deref(), Some("id-newest"));
     }
 
@@ -1192,6 +1303,33 @@ mod tests {
         let got =
             discover_codex_session_id(&cfg, &target, spawned_after, Duration::from_millis(100));
         assert_eq!(got.as_deref(), Some("id-legacy"));
+    }
+
+    #[test]
+    fn discover_codex_rejects_session_started_just_before_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path(), tmp.path());
+        let target = tmp.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let day = today_dir(tmp.path());
+        std::fs::create_dir_all(&day).unwrap();
+        let launched = SystemTime::now();
+        let before = chrono::DateTime::<chrono::Utc>::from(launched - Duration::from_millis(100));
+        let line = serde_json::json!({
+            "timestamp": before.to_rfc3339(),
+            "type": "session_meta",
+            "payload": {
+                "id": "id-prelaunch",
+                "cwd": target.to_string_lossy(),
+            }
+        });
+        // The file itself is new enough to pass the cheap birth-time gate;
+        // its session timestamp proves that it belongs to an earlier launch.
+        std::fs::write(day.join("rollout-prelaunch.jsonl"), format!("{line}\n")).unwrap();
+
+        assert!(
+            discover_codex_session_id(&cfg, &target, launched, Duration::from_millis(50)).is_none()
+        );
     }
 
     #[test]
@@ -1235,24 +1373,15 @@ mod tests {
             return;
         }
 
-        // The new child's own rollout: created after spawn, but with an
-        // OLDER mtime than the streaming session's fresh appends — the
-        // worst case for a newest-mtime matching rule.
+        // The new child's own rollout is created after the launch boundary.
+        // The running rollout still has the tempting fresh append mtime, but
+        // its old birth/session time must keep it ineligible.
         write_rollout(
             &day,
             "rollout-new.jsonl",
             "id-new",
             &target_str,
-            now - Duration::from_secs(1),
-        );
-        let old_mtime = old_md.modified().unwrap();
-        let new_mtime = std::fs::metadata(day.join("rollout-new.jsonl"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        assert!(
-            old_mtime > new_mtime,
-            "fixture: the running session must look newest by mtime"
+            SystemTime::now(),
         );
 
         let got = discover_codex_session_id(&cfg, &target, now, Duration::from_millis(200));

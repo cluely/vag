@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use alacritty_terminal::term::TermMode;
 use anyhow::{Context, Result};
@@ -86,8 +86,38 @@ enum Focus {
 }
 
 /// Context for a spawned runtime whose real session id isn't known yet.
+#[derive(Clone)]
 struct PendingCtx {
     folder: Option<String>,
+    /// Vag-owned display name. Codex has no launch-time naming flag, so it
+    /// travels with the provisional key and is persisted after resolution.
+    name_override: Option<String>,
+    /// Original launch identity. Keeping these across discovery retries is
+    /// critical: Codex can defer its rollout until the first turn finishes.
+    cwd: PathBuf,
+    spawned_after: SystemTime,
+    /// Candidate ids proven to belong to another open runtime. Discovery
+    /// retries skip them so concurrent same-directory launches converge.
+    excluded_ids: HashSet<String>,
+    /// The pane closed while discovery was in flight. Keep a non-rendered
+    /// tombstone so a final successful result can still persist name/folder.
+    closed: bool,
+}
+
+impl PendingCtx {
+    fn new(folder: Option<String>, name: Option<&str>) -> Self {
+        Self {
+            folder,
+            name_override: name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            cwd: PathBuf::new(),
+            spawned_after: SystemTime::UNIX_EPOCH,
+            excluded_ids: HashSet::new(),
+            closed: false,
+        }
+    }
 }
 
 const PASTE_START: &[u8] = b"\x1b[200~";
@@ -390,9 +420,13 @@ struct App {
     active: Option<SessionKey>,
     exited: HashSet<SessionKey>,
     pending: HashMap<SessionKey, PendingCtx>,
-    /// Display titles for provisional runtimes with no scan entry — today
-    /// only ephemeral shell panes ("shell @ gpu" / "shell: proj"). Removed
-    /// with the runtime; never persisted.
+    /// Runtime background threads are born with the provisional key. Events
+    /// already queued (and all later events on older runtimes) are translated
+    /// through this map after the App rekeys its HashMaps to the real id.
+    runtime_aliases: HashMap<SessionKey, SessionKey>,
+    /// Display titles for provisional runtimes with no scan entry: requested
+    /// names while an agent id resolves, plus ephemeral shell labels. Agent
+    /// labels are removed on resolution; shell labels are removed on close.
     provisional_labels: HashMap<SessionKey, String>,
 
     focus: Focus,
@@ -492,6 +526,7 @@ impl App {
             active: None,
             exited: HashSet::new(),
             pending: HashMap::new(),
+            runtime_aliases: HashMap::new(),
             provisional_labels: HashMap::new(),
             focus: Focus::Tree,
             tree_float: false,
@@ -746,6 +781,10 @@ impl App {
         ev: RuntimeEvent,
         _term: &mut Terminal<Backend>,
     ) -> Result<()> {
+        // SessionRuntime's reader may have emitted this with the provisional
+        // key it was spawned under. Translate both queued and future events
+        // after id resolution so wakeups/exits keep targeting the live row.
+        let key = self.runtime_aliases.get(&key).cloned().unwrap_or(key);
         match ev {
             RuntimeEvent::Wakeup => {
                 // Ack first so the runtime can send the next coalesced wakeup.
@@ -817,9 +856,13 @@ impl App {
             .enumerate()
             .map(|(i, m)| (m.key.clone(), i))
             .collect();
-        // Any pending runtime whose id got scanned is no longer provisional
-        // (rescued by on_id_resolved normally; this is belt & braces).
-        self.pending.retain(|k, _| !self.meta_idx.contains_key(k));
+        // A rollout/index row may appear after an earlier discovery window.
+        // Reconcile it to the launch by agent + cwd + creation time. This is
+        // deliberately one-to-one: two Codex panes started in the same repo
+        // must never both claim the newest scanned UUID.
+        for (provisional, id) in self.pending_resolutions_from_scan() {
+            self.on_id_resolved(provisional, Some(id));
+        }
         let mut present: HashSet<String> = self
             .sessions
             .iter()
@@ -857,10 +900,66 @@ impl App {
         self.dirty = true;
     }
 
+    /// Best-effort fallback when the normal discovery worker missed a late
+    /// store entry. The primary resolver uses Codex's SQLite index; this path
+    /// makes periodic scans a second chance instead of a no-op comparison
+    /// between a synthetic `pending-*` key and a real UUID.
+    fn pending_resolutions_from_scan(&self) -> Vec<(SessionKey, String)> {
+        let mut pending: Vec<_> = self.pending.iter().collect();
+        pending.sort_by_key(|(_, ctx)| ctx.spawned_after);
+
+        // Real ids already attached to another runtime cannot be candidates.
+        let mut claimed: HashSet<SessionKey> = self
+            .runtimes
+            .keys()
+            .filter(|key| !key.id.starts_with("pending-"))
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+
+        for (provisional, ctx) in pending {
+            if ctx.cwd.as_os_str().is_empty()
+                || !self
+                    .runtimes
+                    .get(provisional)
+                    .is_some_and(SessionRuntime::is_running)
+            {
+                continue;
+            }
+            let launch = chrono::DateTime::<Utc>::from(ctx.spawned_after);
+            let candidate = self
+                .sessions
+                .iter()
+                .filter(|m| m.key.agent == provisional.agent)
+                .filter(|m| !claimed.contains(&m.key))
+                .filter(|m| !ctx.excluded_ids.contains(&m.key.id))
+                .filter(|m| cwd_equivalent(&m.cwd, &ctx.cwd))
+                .filter_map(|m| {
+                    let created = m.created?;
+                    session_started_in_window(created, ctx.spawned_after).then_some((
+                        created
+                            .signed_duration_since(launch)
+                            .num_milliseconds()
+                            .unsigned_abs(),
+                        &m.key,
+                    ))
+                })
+                .min_by(|(ad, ak), (bd, bk)| ad.cmp(bd).then_with(|| ak.cmp(bk)));
+            if let Some((_, key)) = candidate {
+                claimed.insert(key.clone());
+                out.push((provisional.clone(), key.id.clone()));
+            }
+        }
+        out
+    }
+
     fn on_id_resolved(&mut self, provisional: SessionKey, resolved: Option<String>) {
-        let Some(ctx) = self.pending.remove(&provisional) else {
+        let Some(mut ctx) = self.pending.remove(&provisional) else {
             return;
         };
+        let follow_cursor =
+            self.rows.get(self.cursor).and_then(Row::session_key) == Some(&provisional);
+        let mut rekeyed = None;
         match resolved {
             Some(id) => {
                 let real = SessionKey::new(provisional.agent, id);
@@ -871,7 +970,18 @@ impl App {
                     // discovery: the pane stays provisional and visible,
                     // and no state is written for the (likely mis-)
                     // resolved id.
-                    self.pending.insert(provisional, ctx);
+                    let can_retry = provisional.agent == AgentKind::Codex
+                        && !ctx.cwd.as_os_str().is_empty()
+                        && (ctx.closed
+                            || self
+                                .runtimes
+                                .get(&provisional)
+                                .is_some_and(SessionRuntime::is_running));
+                    ctx.excluded_ids.insert(real.id.clone());
+                    self.pending.insert(provisional.clone(), ctx);
+                    if can_retry {
+                        self.spawn_discovery(&provisional);
+                    }
                     self.set_status(
                         "discovered session id collides with an open session — pane kept \
                          provisional"
@@ -879,6 +989,8 @@ impl App {
                     );
                 } else {
                     if let Some(rt) = self.runtimes.remove(&provisional) {
+                        self.runtime_aliases
+                            .insert(provisional.clone(), real.clone());
                         self.runtimes.insert(real.clone(), rt);
                     }
                     if let Some(a) = self.activity.remove(&provisional) {
@@ -904,25 +1016,72 @@ impl App {
                     if let Some(modal) = self.modal.as_mut() {
                         modal.rekey_session(&provisional, &real);
                     }
-                    if let Some(folder) = ctx.folder
-                        && self.state.folder(&folder).is_some()
+                    if let Some(folder) = ctx.folder.as_ref()
+                        && self.state.folder(folder).is_some()
                     {
-                        let _ = self.state.set_session_folder(&real, Some(&folder));
+                        let _ = self.state.set_session_folder(&real, Some(folder));
                     }
-                    self.state.session_mut(&real).last_opened = Some(Utc::now());
+                    let session = self.state.session_mut(&real);
+                    session.last_opened = Some(Utc::now());
+                    if let Some(name) = ctx.name_override.as_ref() {
+                        session.name_override = Some(name.clone());
+                    }
+                    let resolved_title = dashboard::state_name(&self.state, &real)
+                        .or_else(|| {
+                            self.meta_idx
+                                .get(&real)
+                                .map(|i| dashboard::display_title(&self.state, &self.sessions[*i]))
+                        })
+                        .or_else(|| self.provisional_labels.get(&provisional).cloned())
+                        .unwrap_or_else(|| dashboard::meta_less_title(&real));
+                    if let Some(buf) = self.editbuf.as_mut() {
+                        buf.rekey_session(&provisional, &real, &resolved_title);
+                    }
+                    // The durable state name (or resolved meta-less fallback)
+                    // now owns rendering; retaining the old label would make
+                    // a later "clear name" operation appear ineffective.
+                    self.provisional_labels.remove(&provisional);
                     self.persist();
                     self.request_scan();
+                    rekeyed = Some(real);
                 }
             }
             None => {
-                // Keep the pending entry: the provisional row must stay
-                // visible so the still-running child remains reachable
-                // and closable.
-                self.pending.insert(provisional, ctx);
-                self.set_status("couldn't identify the new session id (pane still works)".into());
+                // Codex can defer durable rollout creation until a slow first
+                // turn completes. Keep retrying in bounded worker windows for
+                // as long as the child lives; a single timeout must never make
+                // the synthetic key permanent.
+                let runtime = self.runtimes.get(&provisional);
+                let running = runtime.is_some_and(SessionRuntime::is_running);
+                let can_retry = running
+                    && (provisional.agent == AgentKind::Codex
+                        || runtime.and_then(SessionRuntime::child_pid).is_some());
+                if can_retry {
+                    self.pending.insert(provisional.clone(), ctx);
+                    self.spawn_discovery(&provisional);
+                    self.set_status(
+                        "still identifying the new session (pane remains usable)".into(),
+                    );
+                } else if !running {
+                    self.set_status(
+                        "couldn't identify the exited session (close the pane to dismiss it)"
+                            .into(),
+                    );
+                } else {
+                    self.pending.insert(provisional.clone(), ctx);
+                    self.set_status(
+                        "couldn't identify the new session id (pane still works)".into(),
+                    );
+                }
             }
         }
         self.rebuild_rows();
+        if follow_cursor
+            && let Some(real) = rekeyed
+            && let Some(index) = locate_row(&self.rows, &RowAnchor::Session(real))
+        {
+            self.cursor = index;
+        }
         self.dirty = true;
     }
 
@@ -1572,9 +1731,11 @@ impl App {
             });
             s
         };
+        // Capture the boundary before the child can create any registry,
+        // SQLite or rollout entry. Sampling after spawn races fast clients.
+        let spawned_after = SystemTime::now();
         match SessionRuntime::spawn(key.clone(), spec, size, events) {
             Ok(rt) => {
-                let child_pid = rt.child_pid();
                 self.runtimes.insert(key.clone(), rt);
                 self.activity.insert(key.clone(), Activity::default());
                 self.last_input_at.remove(&key);
@@ -1586,9 +1747,14 @@ impl App {
                 // fresh child: paste framing can't carry over
                 self.pane_paste.reset();
                 self.focus_pane();
-                if let Some(ctx) = pending {
+                if let Some(mut ctx) = pending {
+                    ctx.cwd = spec.cwd.clone();
+                    ctx.spawned_after = spawned_after;
+                    if let Some(name) = &ctx.name_override {
+                        self.provisional_labels.insert(key.clone(), name.clone());
+                    }
                     self.pending.insert(key.clone(), ctx);
-                    self.spawn_discovery(key.clone(), child_pid, spec.cwd.clone());
+                    self.spawn_discovery(&key);
                 }
                 self.rebuild_rows();
             }
@@ -1596,21 +1762,33 @@ impl App {
         }
     }
 
-    fn spawn_discovery(&self, provisional: SessionKey, child_pid: Option<u32>, cwd: PathBuf) {
+    fn spawn_discovery(&self, provisional: &SessionKey) {
+        let Some(ctx) = self.pending.get(provisional) else {
+            return;
+        };
+        let child_pid = self
+            .runtimes
+            .get(provisional)
+            .and_then(SessionRuntime::child_pid);
+        let cwd = ctx.cwd.clone();
+        let spawned_after = ctx.spawned_after;
+        let excluded_ids = ctx.excluded_ids.clone();
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         let agent = provisional.agent;
-        // No slack subtraction here: the discovery fns apply MTIME_SLACK
-        // themselves (subtracting on both sides doubled the window).
-        let spawned_after = std::time::SystemTime::now();
+        let provisional = provisional.clone();
         std::thread::spawn(move || {
             let resolved = match agent {
                 AgentKind::Claude => child_pid.and_then(|pid| {
                     actions::discover_claude_session_id(&cfg, pid, spawned_after, DISCOVER_DEADLINE)
                 }),
-                AgentKind::Codex => {
-                    actions::discover_codex_session_id(&cfg, &cwd, spawned_after, DISCOVER_DEADLINE)
-                }
+                AgentKind::Codex => actions::discover_codex_session_id_excluding(
+                    &cfg,
+                    &cwd,
+                    spawned_after,
+                    DISCOVER_DEADLINE,
+                    &excluded_ids,
+                ),
                 // Shell panes have no store to discover ids from.
                 AgentKind::Shell => None,
             };
@@ -1667,7 +1845,7 @@ impl App {
         let folder =
             folder.unwrap_or_else(|| self.state.session(key).and_then(|r| r.folder.clone()));
         let prov = Self::provisional_key(key.agent);
-        self.spawn_runtime(prov, &spec, Some(PendingCtx { folder }));
+        self.spawn_runtime(prov, &spec, Some(PendingCtx::new(folder, None)));
         Ok(())
     }
 
@@ -1726,6 +1904,7 @@ impl App {
             EditEvent::Quit => self.editbuf = None,
             EditEvent::OpenSession(k) => {
                 self.editbuf = None;
+                let k = self.runtime_aliases.get(&k).cloned().unwrap_or(k);
                 self.open_session(&k, term)?;
             }
         }
@@ -2368,7 +2547,11 @@ impl App {
         self.last_input_at.remove(key);
         self.exited.remove(key);
         self.open_order.retain(|k| k != key);
-        self.pending.remove(key);
+        if let Some(ctx) = self.pending.get_mut(key) {
+            ctx.closed = true;
+        }
+        self.runtime_aliases
+            .retain(|provisional, real| provisional != key && real != key);
         // Ephemeral shell panes: the label was their only trace.
         self.provisional_labels.remove(key);
         if self.active.as_ref() == Some(key) {
@@ -2973,7 +3156,7 @@ impl App {
     ) {
         if let Some(rname) = remote {
             match agent {
-                AgentKind::Claude => {
+                AgentKind::Claude | AgentKind::Codex => {
                     self.modal = Some(Modal::Input {
                         title: "session name (optional)".into(),
                         edit: LineEdit::default(),
@@ -2987,7 +3170,7 @@ impl App {
                 }
                 // Shell can't reach this agent-session flow; launch_new
                 // surfaces the builder's refusal if it ever does.
-                AgentKind::Codex | AgentKind::Shell => {
+                AgentKind::Shell => {
                     self.launch_new(
                         agent,
                         folder,
@@ -3007,7 +3190,7 @@ impl App {
             return;
         }
         match agent {
-            AgentKind::Claude => {
+            AgentKind::Claude | AgentKind::Codex => {
                 self.modal = Some(Modal::Input {
                     title: "session name (optional)".into(),
                     edit: LineEdit::default(),
@@ -3021,7 +3204,7 @@ impl App {
             }
             // Shell can't reach this agent-session flow; launch_new surfaces
             // the builder's refusal if it ever does.
-            AgentKind::Codex | AgentKind::Shell => {
+            AgentKind::Shell => {
                 self.launch_new(agent, folder, &path, None, None);
             }
         }
@@ -3047,13 +3230,17 @@ impl App {
                 {
                     let _ = self.state.set_session_folder(&key, Some(f));
                 }
-                self.state.session_mut(&key).last_opened = Some(Utc::now());
+                let session = self.state.session_mut(&key);
+                session.last_opened = Some(Utc::now());
+                if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+                    session.name_override = Some(name.to_string());
+                }
                 self.persist();
                 self.spawn_runtime(key, &spec, None);
             }
             Ok((spec, PendingId::Discover)) => {
                 let prov = Self::provisional_key(agent);
-                self.spawn_runtime(prov, &spec, Some(PendingCtx { folder }));
+                self.spawn_runtime(prov, &spec, Some(PendingCtx::new(folder, name)));
             }
             Err(e) => self.set_status(format!("{e:#}")),
         }
@@ -3091,7 +3278,7 @@ impl App {
             return;
         };
         let key = SessionKey::new(agent, id);
-        record_remote_session(&mut self.state, &key, folder.as_deref(), rname, dir);
+        record_remote_session(&mut self.state, &key, folder.as_deref(), rname, dir, name);
         self.persist();
         self.spawn_runtime(key, &spec, None);
         self.request_scan();
@@ -3338,10 +3525,13 @@ impl App {
             .open_order
             .iter()
             .filter(|k| !self.meta_idx.contains_key(*k))
+            .filter(|k| {
+                self.show_hidden || !self.state.session(k).is_some_and(|session| session.hidden)
+            })
             .cloned()
             .collect();
-        for k in self.pending.keys() {
-            if !provisional.contains(k) {
+        for (k, ctx) in &self.pending {
+            if !ctx.closed && !provisional.contains(k) {
                 provisional.push(k.clone());
             }
         }
@@ -4000,9 +4190,10 @@ impl App {
         let meta = self.meta_idx.get(key).map(|i| &self.sessions[*i]);
         let name = meta
             .map(|m| dashboard::display_title(&self.state, m))
+            .or_else(|| dashboard::state_name(&self.state, key))
             .or_else(|| self.provisional_labels.get(key).cloned())
             .or_else(|| self.runtimes.get(key).and_then(|rt| rt.title()))
-            .unwrap_or_else(|| "starting…".into());
+            .unwrap_or_else(|| dashboard::meta_less_title(key));
         let exited = if self.exited.contains(key) {
             format!(
                 " [exited — {} closes]",
@@ -4122,9 +4313,10 @@ impl App {
             .meta_idx
             .get(key)
             .map(|i| dashboard::display_title(&self.state, &self.sessions[*i]))
+            .or_else(|| dashboard::state_name(&self.state, key))
             .or_else(|| self.provisional_labels.get(key).cloned())
             .or_else(|| self.runtimes.get(key).and_then(|rt| rt.title()))
-            .unwrap_or_else(|| "starting…".into());
+            .unwrap_or_else(|| dashboard::meta_less_title(key));
         let exited = if self.exited.contains(key) {
             " [exited — w closes]"
         } else {
@@ -4142,9 +4334,10 @@ impl App {
 }
 
 /// Visible tree rows → edit-buffer lines: the "+ new session" row is
-/// dropped, the Inbox header and provisional sessions (no scan entry yet)
-/// are readonly, folders carry an oil-style trailing slash, and session
-/// text is the current display title. Machine headers become readonly
+/// dropped, the Inbox header and unresolved `pending-*` sessions are
+/// readonly, folders carry an oil-style trailing slash, and session text is
+/// the current display title. Resolved meta-less rows remain editable.
+/// Machine headers become readonly
 /// LineId::Inbox lines ("<name>/ (machine)") so the folder-context
 /// semantics of the lines below them stay None; shell panes are readonly
 /// (labelled) provisional lines.
@@ -4192,13 +4385,14 @@ fn edit_lines_from_rows(
                     Some(i) if key.agent != AgentKind::Shell => {
                         (dashboard::display_title(state, &sessions[*i]), false)
                     }
-                    _ => (
-                        provisional_labels
-                            .get(key)
-                            .cloned()
-                            .unwrap_or_else(|| "(starting…)".to_string()),
-                        true,
-                    ),
+                    _ => {
+                        let text = dashboard::state_name(state, key)
+                            .or_else(|| provisional_labels.get(key).cloned())
+                            .unwrap_or_else(|| dashboard::meta_less_title(key));
+                        let readonly =
+                            key.agent == AgentKind::Shell || key.id.starts_with("pending-");
+                        (text, readonly)
+                    }
                 };
                 Some(EditLine {
                     id: LineId::Session(key.clone()),
@@ -4232,14 +4426,16 @@ fn float_rect(area: Rect) -> Rect {
 }
 
 /// State writes for a freshly launched remote session: folder binding (when
-/// the folder still exists), last_opened, and the remote identity that makes
-/// the entry gc-exempt and resumable (claude) / attach-only (codex).
+/// the folder still exists), optional Vag display name, last_opened, and the
+/// remote identity that makes the entry gc-exempt and resumable (claude) /
+/// attach-only (codex).
 fn record_remote_session(
     state: &mut VagState,
     key: &SessionKey,
     folder: Option<&str>,
     remote: &str,
     dir: &str,
+    name: Option<&str>,
 ) {
     if let Some(f) = folder
         && state.folder(f).is_some()
@@ -4250,6 +4446,9 @@ fn record_remote_session(
     r.last_opened = Some(Utc::now());
     r.remote = Some(remote.to_string());
     r.remote_cwd = Some(dir.to_string());
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        r.name_override = Some(name.to_string());
+    }
 }
 
 /// Synthesize a SessionMeta per remote state entry so remote sessions
@@ -4315,6 +4514,30 @@ fn ssh_shell_spec(host: &str) -> actions::SpawnSpec {
         args: vec!["-t".into(), host.to_string()],
         cwd: dirs::home_dir().unwrap_or_else(std::env::temp_dir),
         env: shell_env(),
+    }
+}
+
+/// The same cwd can be recorded on either side of a symlink boundary.
+/// Prefer the cheap lexical comparison, then canonicalize only as needed.
+fn cwd_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+/// Match an agent-reported session start to the process launch. Exact
+/// timestamps compare at full precision; legacy whole-second timestamps
+/// compare against the launch second so xx.000 can match a spawn at xx.900.
+fn session_started_in_window(created: chrono::DateTime<Utc>, spawned: SystemTime) -> bool {
+    let launch = chrono::DateTime::<Utc>::from(spawned);
+    let end =
+        launch + chrono::Duration::from_std(actions::CODEX_ID_START_WINDOW).unwrap_or_default();
+    if created.timestamp_subsec_nanos() == 0 {
+        created.timestamp() >= launch.timestamp() && created.timestamp() <= end.timestamp()
+    } else {
+        created >= launch && created <= end
     }
 }
 
@@ -4667,7 +4890,7 @@ mod tests {
         app.open_order.push(real.clone());
         app.open_order.push(prov.clone());
         app.pending
-            .insert(prov.clone(), PendingCtx { folder: None });
+            .insert(prov.clone(), PendingCtx::new(None, None));
 
         app.on_id_resolved(prov.clone(), Some("real-id".to_string()));
 
@@ -4679,6 +4902,19 @@ mod tests {
         assert_eq!(app.open_order, vec![real.clone(), prov.clone()]);
         assert!(app.status.is_some(), "collision must be surfaced");
         assert!(app.state.sessions.is_empty(), "no state written for real");
+        assert!(
+            app.pending
+                .get(&prov)
+                .is_some_and(|ctx| ctx.excluded_ids.contains(&real.id)),
+            "the retry must not return the claimed id again"
+        );
+
+        // The retry's next distinct candidate completes the rekey.
+        let other = SessionKey::new(AgentKind::Codex, "other-real-id");
+        app.on_id_resolved(prov.clone(), Some(other.id.clone()));
+        assert!(app.runtimes.contains_key(&real));
+        assert!(app.runtimes.contains_key(&other));
+        assert!(!app.pending.contains_key(&prov));
 
         for (_, mut rt) in app.runtimes.drain() {
             rt.kill();
@@ -4686,19 +4922,194 @@ mod tests {
     }
 
     #[test]
-    fn discovery_timeout_keeps_provisional_row_visible() {
+    fn id_resolution_applies_name_and_routes_old_runtime_events() {
+        let (mut app, _rx) = test_app();
+        let folder = app.state.create_folder("work", None).unwrap();
+        let prov = SessionKey::new(AgentKind::Codex, "pending-named".to_string());
+        let real = SessionKey::new(AgentKind::Codex, "real-named".to_string());
+        let (events, _event_rx) = unbounded();
+        app.runtimes.insert(prov.clone(), spawn_cat(&prov, &events));
+        app.open_order.push(prov.clone());
+        app.active = Some(prov.clone());
+        app.provisional_labels
+            .insert(prov.clone(), "index repair".into());
+        app.pending.insert(
+            prov.clone(),
+            PendingCtx::new(Some(folder.clone()), Some("  index repair  ")),
+        );
+        app.editbuf = Some(EditBuf::new(vec![EditLine {
+            id: LineId::Session(prov.clone()),
+            text: "(starting…)".into(),
+            depth: 1,
+            readonly: true,
+            copied: false,
+        }]));
+        app.rebuild_rows();
+        app.cursor = locate_row(&app.rows, &RowAnchor::Session(prov.clone())).unwrap();
+
+        app.on_id_resolved(prov.clone(), Some(real.id.clone()));
+
+        assert!(!app.pending.contains_key(&prov));
+        assert!(app.runtimes.contains_key(&real));
+        assert_eq!(app.active.as_ref(), Some(&real));
+        assert_eq!(app.rows[app.cursor].session_key(), Some(&real));
+        assert_eq!(app.runtime_aliases.get(&prov), Some(&real));
+        assert!(!app.provisional_labels.contains_key(&prov));
+        assert!(!app.provisional_labels.contains_key(&real));
+        let saved = app.state.session(&real).unwrap();
+        assert_eq!(saved.folder.as_deref(), Some(folder.as_str()));
+        assert_eq!(saved.name_override.as_deref(), Some("index repair"));
+        let line = &app.editbuf.as_ref().unwrap().lines()[0];
+        assert_eq!(line.id, LineId::Session(real.clone()));
+        assert_eq!(line.text, "index repair");
+        assert!(!line.readonly);
+        assert!(!app.editbuf.as_ref().unwrap().dirty());
+        assert!(
+            !app.state
+                .sessions
+                .keys()
+                .any(|key| key.contains("pending-")),
+            "a provisional id must never reach state.json"
+        );
+
+        // Reader-thread events can already be queued with the old key when
+        // resolution happens. They must land on the real session.
+        let mut term = test_terminal();
+        app.on_runtime(prov.clone(), RuntimeEvent::Exited(Some(0)), &mut term)
+            .unwrap();
+        assert!(app.exited.contains(&real));
+        assert!(!app.exited.contains(&prov));
+
+        app.close_runtime(&real);
+        assert!(!app.runtime_aliases.contains_key(&prov));
+    }
+
+    #[test]
+    fn close_before_resolution_keeps_name_and_folder_tombstone() {
+        let (mut app, _rx) = test_app();
+        let folder = app.state.create_folder("work", None).unwrap();
+        let prov = SessionKey::new(AgentKind::Codex, "pending-closing");
+        let real = SessionKey::new(AgentKind::Codex, "real-after-close");
+        let (events, _event_rx) = unbounded();
+        app.runtimes.insert(prov.clone(), spawn_cat(&prov, &events));
+        app.open_order.push(prov.clone());
+        app.pending.insert(
+            prov.clone(),
+            PendingCtx::new(Some(folder.clone()), Some("kept name")),
+        );
+        app.rebuild_rows();
+
+        app.close_runtime(&prov);
+        assert!(app.pending.get(&prov).is_some_and(|ctx| ctx.closed));
+        assert!(app.rows.iter().all(|row| row.session_key() != Some(&prov)));
+
+        app.on_id_resolved(prov.clone(), Some(real.id.clone()));
+        assert!(!app.pending.contains_key(&prov));
+        let saved = app.state.session(&real).unwrap();
+        assert_eq!(saved.folder.as_deref(), Some(folder.as_str()));
+        assert_eq!(saved.name_override.as_deref(), Some("kept name"));
+        assert!(!app.runtimes.contains_key(&real));
+    }
+
+    #[test]
+    fn discovery_timeout_keeps_exited_row_closable_without_leaking_context() {
         let (mut app, _rx) = test_app();
         let prov = SessionKey::new(AgentKind::Codex, "pending-xyz789".to_string());
+        app.open_order.push(prov.clone());
         app.pending
-            .insert(prov.clone(), PendingCtx { folder: None });
+            .insert(prov.clone(), PendingCtx::new(None, None));
 
         app.on_id_resolved(prov.clone(), None);
 
-        assert!(app.pending.contains_key(&prov), "pending entry retained");
+        assert!(
+            !app.pending.contains_key(&prov),
+            "finished context is dropped"
+        );
         assert!(
             app.rows.iter().any(|r| r.session_key() == Some(&prov)),
-            "provisional row still rendered after timeout"
+            "the open-order handle keeps the exited row closable"
         );
+        app.close_runtime(&prov);
+        assert!(app.rows.iter().all(|r| r.session_key() != Some(&prov)));
+    }
+
+    #[test]
+    fn late_scan_reconciles_multiple_pending_sessions_one_to_one() {
+        let (mut app, _rx) = test_app();
+        app.scoped = false;
+        let cwd = tempfile::tempdir().unwrap();
+        let first_launch = SystemTime::now();
+        let second_launch = first_launch + Duration::from_secs(2);
+        let first_prov = SessionKey::new(AgentKind::Codex, "pending-first");
+        let second_prov = SessionKey::new(AgentKind::Codex, "pending-second");
+        let (events, _event_rx) = unbounded();
+        for (key, launch, name) in [
+            (&first_prov, first_launch, "first"),
+            (&second_prov, second_launch, "second"),
+        ] {
+            let mut ctx = PendingCtx::new(None, Some(name));
+            ctx.cwd = cwd.path().to_path_buf();
+            ctx.spawned_after = launch;
+            app.pending.insert(key.clone(), ctx);
+            app.runtimes.insert(key.clone(), spawn_cat(key, &events));
+            app.open_order.push(key.clone());
+        }
+
+        let first_real = SessionKey::new(AgentKind::Codex, "real-first");
+        let second_real = SessionKey::new(AgentKind::Codex, "real-second");
+        let prior_real = SessionKey::new(AgentKind::Codex, "real-prior");
+        let mut prior_meta = meta_for(&prior_real, "existing session");
+        prior_meta.cwd = cwd.path().to_path_buf();
+        prior_meta.created = Some(chrono::DateTime::<Utc>::from(
+            first_launch - Duration::from_millis(100),
+        ));
+        let mut first_meta = meta_for(&first_real, "generated first");
+        first_meta.cwd = cwd.path().to_path_buf();
+        first_meta.created = Some(chrono::DateTime::<Utc>::from(
+            first_launch + Duration::from_millis(100),
+        ));
+        let mut second_meta = meta_for(&second_real, "generated second");
+        second_meta.cwd = cwd.path().to_path_buf();
+        second_meta.created = Some(chrono::DateTime::<Utc>::from(
+            second_launch + Duration::from_millis(100),
+        ));
+
+        app.on_scan_done(scan_with(vec![second_meta, prior_meta, first_meta]));
+
+        assert!(app.pending.is_empty());
+        assert_eq!(
+            app.state
+                .session(&first_real)
+                .and_then(|s| s.name_override.as_deref()),
+            Some("first")
+        );
+        assert_eq!(
+            app.state
+                .session(&second_real)
+                .and_then(|s| s.name_override.as_deref()),
+            Some("second")
+        );
+        assert!(!app.guard_provisional(&first_real));
+        assert!(!app.guard_provisional(&second_real));
+        assert!(app.state.session(&prior_real).is_none());
+
+        app.close_runtime(&first_real);
+        app.close_runtime(&second_real);
+    }
+
+    #[test]
+    fn session_start_window_handles_legacy_seconds_without_previous_second() {
+        let launch = SystemTime::UNIX_EPOCH + Duration::from_millis(10_900);
+        let same_second = chrono::DateTime::<Utc>::from_timestamp(10, 0).unwrap();
+        let previous_second = chrono::DateTime::<Utc>::from_timestamp(9, 0).unwrap();
+        assert!(session_started_in_window(same_second, launch));
+        assert!(!session_started_in_window(previous_second, launch));
+        assert!(!session_started_in_window(
+            chrono::DateTime::<Utc>::from(
+                launch + actions::CODEX_ID_START_WINDOW + Duration::from_secs(1)
+            ),
+            launch,
+        ));
     }
 
     #[test]
@@ -4706,7 +5117,7 @@ mod tests {
         let (mut app, _rx) = test_app();
         let prov = SessionKey::new(AgentKind::Codex, "pending-xyz789".to_string());
         app.pending
-            .insert(prov.clone(), PendingCtx { folder: None });
+            .insert(prov.clone(), PendingCtx::new(None, None));
         app.rebuild_rows();
         app.cursor = locate_row(&app.rows, &RowAnchor::Session(prov.clone())).unwrap();
 
@@ -5521,6 +5932,59 @@ mod tests {
     }
 
     #[test]
+    fn codex_directory_commit_always_asks_for_optional_name() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let (mut local, _rx) = test_app();
+        local.commit_new_session_dir(
+            AgentKind::Codex,
+            Some("folder".into()),
+            local_dir.path().display().to_string(),
+            None,
+        );
+        match &local.modal {
+            Some(Modal::Input {
+                title,
+                kind:
+                    InputKind::NewSessionName {
+                        agent,
+                        folder,
+                        remote,
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(title, "session name (optional)");
+                assert_eq!(*agent, AgentKind::Codex);
+                assert_eq!(folder.as_deref(), Some("folder"));
+                assert!(remote.is_none());
+            }
+            other => panic!("expected local Codex name input, got {other:?}"),
+        }
+
+        let (mut remote_app, _rx) = app_with_cfg(cfg_with_remote());
+        remote_app.commit_new_session_dir(
+            AgentKind::Codex,
+            None,
+            "~/not-on-this-machine".into(),
+            Some("gpu".into()),
+        );
+        match &remote_app.modal {
+            Some(Modal::Input {
+                kind:
+                    InputKind::NewSessionName {
+                        agent, dir, remote, ..
+                    },
+                ..
+            }) => {
+                assert_eq!(*agent, AgentKind::Codex);
+                assert_eq!(dir, "~/not-on-this-machine");
+                assert_eq!(remote.as_deref(), Some("gpu"));
+            }
+            other => panic!("expected remote Codex name input, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dir_picker_seeds_prefill_and_scan_batches() {
         let mut cfg = Config::default();
         cfg.agents.claude.command = "/bin/cat".into();
@@ -5566,16 +6030,24 @@ mod tests {
         let mut st = VagState::default();
         let fid = st.create_folder("work", None).unwrap();
         let key = SessionKey::new(AgentKind::Claude, "abc-uuid");
-        record_remote_session(&mut st, &key, Some(&fid), "gpu", "~/proj");
+        record_remote_session(
+            &mut st,
+            &key,
+            Some(&fid),
+            "gpu",
+            "~/proj",
+            Some("  remote repair  "),
+        );
         let r = st.session(&key).unwrap();
         assert_eq!(r.folder.as_deref(), Some(fid.as_str()));
         assert_eq!(r.remote.as_deref(), Some("gpu"));
         assert_eq!(r.remote_cwd.as_deref(), Some("~/proj"));
+        assert_eq!(r.name_override.as_deref(), Some("remote repair"));
         assert!(r.last_opened.is_some());
 
         // Dangling folder: binding skipped, identity still written.
         let k2 = SessionKey::new(AgentKind::Codex, "remote-xyz");
-        record_remote_session(&mut st, &k2, Some("gone"), "gpu", "~");
+        record_remote_session(&mut st, &k2, Some("gone"), "gpu", "~", None);
         let r = st.session(&k2).unwrap();
         assert_eq!(r.folder, None);
         assert_eq!(r.remote.as_deref(), Some("gpu"));

@@ -334,6 +334,41 @@ impl EditBuf {
         self.baseline = self.lines.clone();
     }
 
+    /// A live provisional session acquired its durable id. Rewrite every
+    /// buffer snapshot so Enter/undo/redo/diff can never resurrect the old
+    /// key, and make the formerly provisional line editable without marking
+    /// unrelated user edits dirty.
+    pub fn rekey_session(&mut self, from: &SessionKey, to: &SessionKey, title: &str) {
+        let current_row_rekeyed = self
+            .lines
+            .get(self.row)
+            .is_some_and(|line| matches!(&line.id, LineId::Session(key) if key == from));
+        let rekey_lines = |lines: &mut [EditLine]| {
+            for line in lines {
+                if let LineId::Session(key) = &mut line.id
+                    && key == from
+                {
+                    *key = to.clone();
+                    if line.readonly {
+                        line.readonly = false;
+                        line.text = title.to_string();
+                    }
+                }
+            }
+        };
+        rekey_lines(&mut self.lines);
+        rekey_lines(&mut self.baseline);
+        for snapshot in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            rekey_lines(&mut snapshot.lines);
+        }
+        if let Some((line, _)) = &mut self.register {
+            rekey_lines(std::slice::from_mut(line));
+        }
+        if current_row_rekeyed {
+            self.clamp_col_normal();
+        }
+    }
+
     // ---- diff internals -------------------------------------------------
 
     /// Per session key: greedily pair each current occurrence with an
@@ -1517,6 +1552,39 @@ mod tests {
         assert!(matches!(press(&mut b, "i"), EditEvent::Message(_)));
         // Opening is not a mutation: the app decides what Enter means here.
         assert_eq!(enter(&mut b), EditEvent::OpenSession(skey("prov")));
+    }
+
+    #[test]
+    fn background_rekey_preserves_insert_cursor_on_another_line() {
+        let from = skey("pending-old");
+        let to = skey("resolved-new");
+        let mut buf = EditBuf::new(vec![
+            EditLine {
+                id: LineId::Session(from.clone()),
+                text: "(starting…)".into(),
+                depth: 1,
+                readonly: true,
+                copied: false,
+            },
+            EditLine {
+                id: LineId::Session(skey("other")),
+                text: "abc".into(),
+                depth: 1,
+                readonly: false,
+                copied: false,
+            },
+        ]);
+        buf.handle_key(&Key::Char('j'));
+        buf.handle_key(&Key::Char('A'));
+        assert_eq!(buf.cursor(), (1, 3));
+
+        buf.rekey_session(&from, &to, "named");
+        assert_eq!(buf.cursor(), (1, 3));
+        assert_eq!(*buf.mode(), Mode::Insert);
+        buf.handle_key(&Key::Char('X'));
+        assert_eq!(buf.lines()[1].text, "abcX");
+        assert_eq!(buf.lines()[0].id, LineId::Session(to));
+        assert!(!buf.lines()[0].readonly);
     }
 
     // ---- renames ---------------------------------------------------------

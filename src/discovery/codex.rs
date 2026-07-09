@@ -4,10 +4,10 @@
 //! - `<codex_home>/state_*.sqlite` (currently `state_5.sqlite`; the filename
 //!   version bumps on schema changes — glob and pick the highest N, keep the
 //!   jsonl fallback working if the schema surprises us).
-//! - The db is WAL-mode and a plain read-only open FAILS while codex holds
-//!   it. NEVER open the live file directly: snapshot-copy `state_N.sqlite`
-//!   plus `-wal`/`-shm` siblings (if present) into a temp dir, then open the
-//!   copy read-only.
+//! - Dashboard scans snapshot-copy `state_N.sqlite` plus `-wal`/`-shm`
+//!   siblings before opening. The launch-id hot path first tries a short,
+//!   read-only WAL transaction with a narrow column set, then falls back to
+//!   the same snapshot path when the live database is exclusively locked.
 //! - Table `threads` columns (verify with PRAGMA table_info, treat all as
 //!   optional): id, rollout_path (absolute), cwd, title, preview,
 //!   first_user_message, created_at/updated_at (unix seconds; *_ms variants
@@ -47,6 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
@@ -178,6 +179,180 @@ fn scan_sqlite(db: &Path, show_automation: bool) -> Result<Vec<SessionMeta>> {
         .collect())
 }
 
+/// Find the first interactive CLI thread created for `cwd` after a child
+/// launch. Unlike the normal dashboard scan this intentionally does *not*
+/// require `rollout_path` to exist: Codex 0.144 inserts the SQLite thread
+/// immediately but may defer materializing the rollout until a first turn
+/// finishes. That early row is the reliable identity hand-off Vag needs.
+pub(crate) fn find_new_cli_thread_id(
+    cfg: &Config,
+    cwd: &Path,
+    spawned_after: SystemTime,
+    spawned_before: SystemTime,
+    excluded_ids: &HashSet<String>,
+) -> Result<Option<String>> {
+    let home = cfg.codex_home();
+    let Some(db) = find_state_db(&home) else {
+        return Ok(None);
+    };
+    // A normal WAL database supports consistent read transactions directly
+    // and this narrow query is far cheaper than copying the whole store on
+    // every poll. Fall back to the established snapshot path for hosts where
+    // the live file is exclusively locked or needs WAL recovery.
+    let rows = match query_identity_rows(&db, true) {
+        Ok(rows) => rows,
+        Err(_) => {
+            let tmp = tempfile::tempdir().context("creating id-discovery snapshot temp dir")?;
+            let snapshot = snapshot_db(&db, tmp.path())?;
+            query_identity_rows(&snapshot, false)?
+        }
+    };
+    let launch_ms = spawned_after
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let launch_end_ms = spawned_before
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+
+    let mut best: Option<(i64, String)> = None;
+    for row in rows {
+        // `source` was added after the first SQLite schema. Missing means
+        // "unknown/legacy" and remains eligible; explicit subagent/app
+        // sources must not steal an interactive CLI launch.
+        if !matches!(row.source.as_deref(), None | Some("cli")) {
+            continue;
+        }
+        if is_noise(&row) {
+            continue;
+        }
+        let Some(candidate_cwd) = row.cwd.as_deref() else {
+            continue;
+        };
+        if !cwd_equivalent(Path::new(candidate_cwd), cwd) {
+            continue;
+        }
+        let Some(created_ms) = row_created_in_launch_window(&row, launch_ms, launch_end_ms) else {
+            continue;
+        };
+        let Some(id) = row.id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if excluded_ids.contains(&id) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_ms, best_id)| (created_ms, &id) < (*best_ms, best_id))
+        {
+            best = Some((created_ms, id));
+        }
+    }
+    Ok(best.map(|(_, id)| id))
+}
+
+fn row_created_in_launch_window(
+    row: &ThreadRow,
+    launch_ms: i64,
+    launch_end_ms: i64,
+) -> Option<i64> {
+    if let Some(ms) = row.created_at_ms.filter(|&ms| ms > 0) {
+        return (ms >= launch_ms && ms <= launch_end_ms).then_some(ms);
+    }
+    let raw = row.created_at.filter(|&created| created > 0)?;
+    // Some schema versions/migrations have put milliseconds in the nominal
+    // seconds column; use the same leniency as dashboard metadata parsing.
+    if raw > 100_000_000_000 {
+        return (raw >= launch_ms && raw <= launch_end_ms).then_some(raw);
+    }
+    // Legacy schemas only have whole seconds. Permit the launch's current
+    // second to round down, but never admit the previous second.
+    let launch_seconds = launch_ms / 1000;
+    let launch_end_seconds = launch_end_ms / 1000;
+    (raw >= launch_seconds && raw <= launch_end_seconds).then_some(raw.saturating_mul(1000))
+}
+
+fn cwd_equivalent(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+/// Minimal schema-tolerant identity query. Unlike the dashboard query, this
+/// does not require `rollout_path`: the whole point is to identify a thread
+/// before that path is durable (and to survive future path-column changes).
+fn query_identity_rows(db: &Path, read_only: bool) -> Result<Vec<ThreadRow>> {
+    let flags = if read_only {
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+    };
+    let conn = Connection::open_with_flags(db, flags)
+        .with_context(|| format!("opening Codex identity index {}", db.display()))?;
+    conn.busy_timeout(Duration::from_millis(50))?;
+
+    let mut have = HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Ok(name) = row.get::<_, String>(1) {
+                have.insert(name);
+            }
+        }
+    }
+    if !have.contains("id") || !have.contains("cwd") {
+        anyhow::bail!("threads table missing id/cwd");
+    }
+    if !have.contains("created_at") && !have.contains("created_at_ms") {
+        anyhow::bail!("threads table missing creation timestamp");
+    }
+
+    const WANTED: [&str; 7] = [
+        "id",
+        "cwd",
+        "created_at",
+        "created_at_ms",
+        "thread_source",
+        "has_user_event",
+        "source",
+    ];
+    let cols: Vec<&str> = WANTED
+        .iter()
+        .copied()
+        .filter(|column| have.contains(*column))
+        .collect();
+    let idx: HashMap<&str, usize> = cols
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (*column, index))
+        .collect();
+    let sql = format!("SELECT {} FROM threads", cols.join(", "));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let s = |column: &str| idx.get(column).and_then(|&index| str_at(row, index));
+        let n = |column: &str| idx.get(column).and_then(|&index| int_at(row, index));
+        out.push(ThreadRow {
+            id: s("id"),
+            cwd: s("cwd"),
+            created_at: n("created_at"),
+            created_at_ms: n("created_at_ms"),
+            thread_source: s("thread_source"),
+            has_user_event: n("has_user_event"),
+            source: s("source"),
+            ..ThreadRow::default()
+        });
+    }
+    Ok(out)
+}
+
 /// Copy the db plus `-wal`/`-shm` siblings (when present) into `dest_dir`.
 /// Returns the path of the copy — the only file we ever hand to sqlite.
 fn snapshot_db(db: &Path, dest_dir: &Path) -> Result<PathBuf> {
@@ -216,6 +391,7 @@ struct ThreadRow {
     thread_source: Option<String>,
     has_user_event: Option<i64>,
     git_branch: Option<String>,
+    source: Option<String>,
 }
 
 /// Open a *snapshot copy* and read the threads table. Read-write open on
@@ -242,7 +418,7 @@ fn query_threads(snapshot: &Path) -> Result<Vec<ThreadRow>> {
         anyhow::bail!("threads table missing id/rollout_path (schema drift or absent table)");
     }
 
-    const WANTED: [&str; 14] = [
+    const WANTED: [&str; 15] = [
         "id",
         "rollout_path",
         "cwd",
@@ -257,6 +433,7 @@ fn query_threads(snapshot: &Path) -> Result<Vec<ThreadRow>> {
         "thread_source",
         "has_user_event",
         "git_branch",
+        "source",
     ];
     let cols: Vec<&str> = WANTED
         .iter()
@@ -288,6 +465,7 @@ fn query_threads(snapshot: &Path) -> Result<Vec<ThreadRow>> {
             thread_source: s("thread_source"),
             has_user_event: n("has_user_event"),
             git_branch: s("git_branch"),
+            source: s("source"),
         });
     }
     Ok(out)
@@ -663,7 +841,8 @@ mod tests {
     const FULL_SCHEMA: &str = "CREATE TABLE threads (
         id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
         preview TEXT, first_user_message TEXT, created_at INTEGER,
-        updated_at INTEGER, archived INTEGER, thread_source TEXT,
+        updated_at INTEGER, created_at_ms INTEGER, updated_at_ms INTEGER,
+        archived INTEGER, thread_source TEXT,
         has_user_event INTEGER, git_branch TEXT, source TEXT)";
 
     #[allow(clippy::too_many_arguments)]
@@ -804,6 +983,143 @@ mod tests {
         drop(conn);
 
         assert_eq!(ids(&scan(&fx.cfg).unwrap()), vec![alive.as_str()]);
+    }
+
+    #[test]
+    fn id_lookup_uses_early_sqlite_row_without_a_rollout() {
+        let fx = fixture();
+        let db = fx.home.join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(FULL_SCHEMA).unwrap();
+        let cwd = fx.home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let launch_ms = 10_000_i64;
+        let launch = UNIX_EPOCH + std::time::Duration::from_millis(launch_ms as u64);
+
+        let old = uid(1);
+        let subagent = uid(2);
+        let first_cli = uid(3);
+        let second_cli = uid(4);
+        let elsewhere = uid(5);
+        for (id, created_ms, row_cwd, source) in [
+            (&old, 9_000, cwd.as_path(), "cli"),
+            (&subagent, 10_010, cwd.as_path(), r#"{"subagent":{}}"#),
+            (&elsewhere, 10_015, Path::new("/elsewhere"), "cli"),
+            (&first_cli, 10_020, cwd.as_path(), "cli"),
+            (&second_cli, 10_030, cwd.as_path(), "cli"),
+        ] {
+            conn.execute(
+                "INSERT INTO threads
+                 (id, rollout_path, cwd, created_at_ms, thread_source,
+                  has_user_event, source)
+                 VALUES (?1, ?2, ?3, ?4, 'user', 0, ?5)",
+                rusqlite::params![
+                    id,
+                    fx.home
+                        .join(format!("missing-{id}.jsonl"))
+                        .to_str()
+                        .unwrap(),
+                    row_cwd.to_str().unwrap(),
+                    created_ms,
+                    source,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        // The normal dashboard scan correctly requires a durable rollout,
+        // but launch-id discovery must see the immediate metadata row.
+        assert!(scan(&fx.cfg).unwrap().is_empty());
+        assert_eq!(
+            find_new_cli_thread_id(
+                &fx.cfg,
+                &cwd,
+                launch,
+                launch + std::time::Duration::from_secs(60),
+                &HashSet::new(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(first_cli.as_str())
+        );
+        assert_eq!(
+            find_new_cli_thread_id(
+                &fx.cfg,
+                &cwd,
+                launch,
+                launch + std::time::Duration::from_secs(60),
+                &HashSet::from([first_cli.clone()]),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(second_cli.as_str())
+        );
+    }
+
+    #[test]
+    fn id_lookup_needs_no_rollout_path_column() {
+        let fx = fixture();
+        let conn = Connection::open(fx.home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, cwd TEXT, created_at_ms INTEGER,
+                thread_source TEXT, has_user_event INTEGER, source TEXT
+            )",
+        )
+        .unwrap();
+        let cwd = fx.home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let launch_ms = 1_800_000_000_000_i64;
+        let id = uid(9);
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3, 'user', 0, 'cli')",
+            rusqlite::params![id, cwd.to_str().unwrap(), launch_ms + 10],
+        )
+        .unwrap();
+        drop(conn);
+        let launch = UNIX_EPOCH + Duration::from_millis(launch_ms as u64);
+        assert_eq!(
+            find_new_cli_thread_id(
+                &fx.cfg,
+                &cwd,
+                launch,
+                launch + Duration::from_secs(60),
+                &HashSet::new(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(id.as_str())
+        );
+    }
+
+    #[test]
+    fn id_timestamp_normalizes_millis_in_created_at_column() {
+        let launch_ms = 1_800_000_000_500_i64;
+        let before = ThreadRow {
+            created_at: Some(launch_ms - 1),
+            ..ThreadRow::default()
+        };
+        let inside = ThreadRow {
+            created_at: Some(launch_ms + 1),
+            ..ThreadRow::default()
+        };
+        assert_eq!(
+            row_created_in_launch_window(&before, launch_ms, launch_ms + 60_000),
+            None
+        );
+        assert_eq!(
+            row_created_in_launch_window(&inside, launch_ms, launch_ms + 60_000),
+            Some(launch_ms + 1)
+        );
+        let after = ThreadRow {
+            created_at: Some(launch_ms + 60_001),
+            ..ThreadRow::default()
+        };
+        assert_eq!(
+            row_created_in_launch_window(&after, launch_ms, launch_ms + 60_000),
+            None
+        );
     }
 
     #[test]
@@ -1095,12 +1411,25 @@ mod tests {
         let mut cfg_all = cfg.clone();
         cfg_all.behavior.codex_show_automation = true;
         let all = scan_rollouts(&cfg_all).unwrap();
+        let now = SystemTime::now();
+        let early_lookup = std::env::current_dir().ok().and_then(|cwd| {
+            find_new_cli_thread_id(
+                &cfg,
+                &cwd,
+                now - Duration::from_secs(24 * 60 * 60),
+                now,
+                &HashSet::new(),
+            )
+            .ok()
+            .flatten()
+        });
         println!(
             "real ~/.codex: sqlite path {} sessions in {dt:?}; fallback walk {} \
-             ({} with automation) in {dt_fb:?}",
+             ({} with automation) in {dt_fb:?}; early-id lookup={}",
             sessions.len(),
             rollouts.len(),
-            all.len()
+            all.len(),
+            early_lookup.is_some(),
         );
         for s in sessions.iter().take(3) {
             // Titles only — never print transcript content.
