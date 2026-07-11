@@ -1,7 +1,10 @@
 pub mod activity;
+pub mod ansi;
 pub mod app;
 pub mod dashboard;
+pub mod diffview;
 pub mod editbuf;
+pub mod heatmap;
 pub mod icons;
 pub mod input;
 pub mod pane;

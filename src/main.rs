@@ -1,9 +1,13 @@
 mod actions;
+mod agent_events;
 mod config;
 mod dirscan;
 mod discovery;
+mod gitdiff;
 mod runtime;
 mod state;
+mod stats;
+mod touched;
 mod types;
 mod ui;
 
@@ -23,6 +27,14 @@ fn default_sigpipe() {
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Claude lifecycle hooks invoke this hidden, best-effort relay. Dispatch
+    // it before global TUI flag parsing: its opaque socket/secret arguments
+    // must never be mistaken for user-facing vag options.
+    if args.first().map(String::as_str) == Some("_agent-event") {
+        default_sigpipe();
+        agent_events::emit_from_hook(&args[1..]);
+        return Ok(());
+    }
     // Global TUI flags, parsed out before command dispatch. Each maps to an
     // env override consumed by Config::load (usable directly as env vars).
     // SAFETY of set_var: single-threaded here — no other threads exist yet.

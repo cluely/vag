@@ -59,12 +59,37 @@ pub struct Config {
     pub agents: AgentsConfig,
     pub ui: UiConfig,
     pub behavior: BehaviorConfig,
+    pub diff: DiffConfig,
     /// Per-key color overrides applied on top of `ui.theme` (palette names
     /// or "#rrggbb").
     pub theme: ThemeOverrides,
     /// SSH machines sessions can be created on ("cloud vs local"). Empty =
     /// the new-session flow skips the location step entirely.
     pub remotes: Vec<RemoteConfig>,
+}
+
+/// `[diff]` table: the per-session diff view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffConfig {
+    /// Render diff bodies through [delta](https://github.com/dandavison/delta)
+    /// when it's on PATH — syntax highlighting and the user's own delta
+    /// config for free. Missing binary or a failed run falls back to the
+    /// builtin renderer silently; the file tree/scoping are vag's either way.
+    pub use_delta: bool,
+    /// Extra args appended to every delta invocation (e.g.
+    /// ["--side-by-side"]). vag always passes --paging=never, --width and
+    /// --file-style=omit; later args win, so these can override styling.
+    pub delta_args: Vec<String>,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        DiffConfig {
+            use_delta: true,
+            delta_args: vec![],
+        }
+    }
 }
 
 /// `[theme]` table: any subset of keys, layered over the named base theme.
@@ -145,12 +170,14 @@ pub enum KeyAction {
     Delete,
     CloseRuntime,
     Zoom,
+    /// Toggle the active session's diff tab (agent PTY ⇄ git diff view).
+    DiffView,
     /// Open the settings page (also reachable via the pinned ⚙ row).
     Settings,
 }
 
 impl KeyAction {
-    pub const ALL: [KeyAction; 20] = [
+    pub const ALL: [KeyAction; 21] = [
         KeyAction::Quit,
         KeyAction::Help,
         KeyAction::NewSession,
@@ -170,6 +197,7 @@ impl KeyAction {
         KeyAction::Delete,
         KeyAction::CloseRuntime,
         KeyAction::Zoom,
+        KeyAction::DiffView,
         KeyAction::Settings,
     ];
 
@@ -195,6 +223,7 @@ impl KeyAction {
             KeyAction::Delete => "delete",
             KeyAction::CloseRuntime => "close",
             KeyAction::Zoom => "zoom",
+            KeyAction::DiffView => "diff",
             KeyAction::Settings => "settings",
         }
     }
@@ -221,6 +250,7 @@ impl KeyAction {
             KeyAction::Delete => "delete",
             KeyAction::CloseRuntime => "close process",
             KeyAction::Zoom => "zoom full-screen",
+            KeyAction::DiffView => "diff view (agent ⇄ diff tab)",
             KeyAction::Settings => "open settings",
         }
     }
@@ -246,6 +276,7 @@ impl KeyAction {
             KeyAction::Delete => 'x',
             KeyAction::CloseRuntime => 'w',
             KeyAction::Zoom => 'z',
+            KeyAction::DiffView => 'D',
             KeyAction::Settings => ',',
         }
     }
@@ -268,14 +299,19 @@ pub enum CtrlAction {
     ToggleSidebar,
     FocusTree,
     FocusPane,
+    /// Flip the active session between its agent PTY and its diff view —
+    /// the one diff key that must work while the pane has focus (plain
+    /// chars are forwarded to the child there).
+    ToggleDiff,
 }
 
 impl CtrlAction {
-    pub const ALL: [CtrlAction; 4] = [
+    pub const ALL: [CtrlAction; 5] = [
         CtrlAction::Detach,
         CtrlAction::ToggleSidebar,
         CtrlAction::FocusTree,
         CtrlAction::FocusPane,
+        CtrlAction::ToggleDiff,
     ];
 
     pub fn name(self) -> &'static str {
@@ -284,6 +320,7 @@ impl CtrlAction {
             CtrlAction::ToggleSidebar => "toggle_sidebar",
             CtrlAction::FocusTree => "focus_tree",
             CtrlAction::FocusPane => "focus_pane",
+            CtrlAction::ToggleDiff => "toggle_diff",
         }
     }
 
@@ -293,6 +330,7 @@ impl CtrlAction {
             CtrlAction::ToggleSidebar => "toggle sidebar (in pane)",
             CtrlAction::FocusTree => "focus tree (from pane)",
             CtrlAction::FocusPane => "focus active session (from tree)",
+            CtrlAction::ToggleDiff => "toggle diff view (in pane)",
         }
     }
 
@@ -306,6 +344,8 @@ impl CtrlAction {
             CtrlAction::ToggleSidebar => DetachKey(0x05),
             CtrlAction::FocusTree => DetachKey(0x08),
             CtrlAction::FocusPane => DetachKey(0x0c),
+            // Ctrl-G: free in both agents' composers and mnemonic for git.
+            CtrlAction::ToggleDiff => DetachKey(0x07),
         }
     }
 
@@ -330,6 +370,9 @@ pub struct KeysConfig {
     pub focus_tree: DetachKey,
     /// Switch focus to the active session's pane while the tree has focus.
     pub focus_pane: DetachKey,
+    /// Flip the active session between agent PTY and diff view while the
+    /// pane has focus.
+    pub toggle_diff: DetachKey,
     chars: [char; KeyAction::ALL.len()],
 }
 
@@ -384,6 +427,7 @@ impl KeysConfig {
             CtrlAction::ToggleSidebar => self.toggle_sidebar,
             CtrlAction::FocusTree => self.focus_tree,
             CtrlAction::FocusPane => self.focus_pane,
+            CtrlAction::ToggleDiff => self.toggle_diff,
         }
     }
 
@@ -393,6 +437,7 @@ impl KeysConfig {
             CtrlAction::ToggleSidebar => self.toggle_sidebar = k,
             CtrlAction::FocusTree => self.focus_tree = k,
             CtrlAction::FocusPane => self.focus_pane = k,
+            CtrlAction::ToggleDiff => self.toggle_diff = k,
         }
     }
 
@@ -524,6 +569,10 @@ pub struct UiConfig {
     /// or "transparent" (no background — the terminal shows through).
     /// Fine-tune any key via the [theme] table. Per run: --theme/VAG_THEME.
     pub theme: String,
+    /// Mouse support: wheel scrolls the pane's scrollback (or the tree),
+    /// clicks focus the pane; children that enable mouse reporting get the
+    /// events forwarded. Costs native drag-selection (use Shift+drag).
+    pub mouse: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -612,6 +661,7 @@ impl Default for KeysConfig {
             toggle_sidebar: CtrlAction::ToggleSidebar.default_key(),
             focus_tree: CtrlAction::FocusTree.default_key(),
             focus_pane: CtrlAction::FocusPane.default_key(),
+            toggle_diff: CtrlAction::ToggleDiff.default_key(),
             chars,
         }
     }
@@ -626,6 +676,7 @@ impl Default for UiConfig {
             pane: PaneStyle::Titlebar,
             edit_default: false,
             theme: "night".into(),
+            mouse: true,
         }
     }
 }

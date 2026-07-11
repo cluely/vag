@@ -46,6 +46,9 @@ pub struct Icons {
     pub clock: &'static str,
     /// The "settings" row pinned at the top of the tree.
     pub settings: &'static str,
+    /// Generic file mark in the diff view's file tree; empty in ascii mode
+    /// (the status letter already anchors those rows).
+    pub file: &'static str,
 }
 
 impl Icons {
@@ -66,6 +69,7 @@ impl Icons {
         branch: "⎇",
         clock: "",
         settings: "⚙",
+        file: "",
     };
 
     /// Nerd Font glyphs; codepoints verified against the nerd-fonts
@@ -86,6 +90,7 @@ impl Icons {
         branch: "\u{F418}",            // nf-oct-git_branch
         clock: "\u{F0150}",            // nf-md-clock_outline
         settings: "\u{F0493}",         // nf-md-cog
+        file: "\u{F016}",              // nf-fa-file_o
     };
 
     /// Resolve the set for a configured mode (`IconMode::use_nerd` handles
@@ -110,6 +115,44 @@ impl Icons {
             AgentKind::Codex => self.codex,
             // Shell panes use the plain glyph in both icon sets.
             AgentKind::Shell => AgentKind::Shell.icon(),
+        }
+    }
+
+    /// Per-filetype mark for the diff view's file tree. ASCII mode returns
+    /// "" (rows keep their pre-icon look); nerd mode maps common extensions
+    /// and falls back to the generic file glyph. Codepoints verified
+    /// against glyphnames.json like the rest of the NERD set.
+    pub fn file_icon(&self, name: &str) -> &'static str {
+        if self.file.is_empty() {
+            return "";
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with(".git") {
+            return "\u{E702}"; // nf-dev-git
+        }
+        if lower.ends_with(".lock") || lower == "package-lock.json" {
+            return "\u{F023}"; // nf-fa-lock
+        }
+        let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+        match ext {
+            "rs" => "\u{E7A8}",                                // nf-dev-rust
+            "py" => "\u{E73C}",                                // nf-dev-python
+            "js" | "jsx" | "mjs" | "cjs" => "\u{E718}",        // nf-dev-nodejs_small
+            "ts" | "tsx" => "\u{E628}",                        // nf-seti-typescript
+            "json" => "\u{E60B}",                              // nf-seti-json
+            "md" | "markdown" => "\u{F48A}",                   // nf-oct-markdown
+            "toml" | "ini" | "conf" | "cfg" => "\u{E615}",     // nf-seti-config
+            "yml" | "yaml" => "\u{E6A8}",                      // nf-seti-yml
+            "sh" | "bash" | "zsh" | "fish" => "\u{F489}",      // nf-oct-terminal
+            "html" | "htm" => "\u{E736}",                      // nf-dev-html5
+            "css" | "scss" | "less" => "\u{E749}",             // nf-dev-css3
+            "go" => "\u{E627}",                                // nf-seti-go
+            "swift" => "\u{E755}",                             // nf-dev-swift
+            "c" | "h" => "\u{E61E}",                           // nf-custom-c
+            "cpp" | "cc" | "hpp" | "cxx" => "\u{E61D}",        // nf-custom-cpp
+            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => "\u{F1C5}", // nf-fa-file_image_o
+            "diff" | "patch" => "\u{F4D2}",                    // nf-oct-file_diff
+            _ => self.file,
         }
     }
 }
@@ -168,6 +211,19 @@ mod tests {
         // Verified against glyphnames.json: md-laptop = f0322, md-cloud = f015f.
         assert_eq!(Icons::NERD.local, "\u{F0322}");
         assert_eq!(Icons::NERD.remote, "\u{F015F}");
+    }
+
+    #[test]
+    fn file_icons_map_extensions_and_ascii_stays_bare() {
+        let n = Icons::NERD;
+        assert_eq!(n.file_icon("main.rs"), "\u{E7A8}");
+        assert_eq!(n.file_icon("app.TSX"), "\u{E628}");
+        assert_eq!(n.file_icon("Cargo.lock"), "\u{F023}");
+        assert_eq!(n.file_icon(".gitignore"), "\u{E702}");
+        assert_eq!(n.file_icon("notes.md"), "\u{F48A}");
+        assert_eq!(n.file_icon("Makefile"), n.file, "unknown → generic file");
+        // ASCII mode: no file icons at all — rows stay pixel-identical.
+        assert_eq!(Icons::ASCII.file_icon("main.rs"), "");
     }
 
     #[test]

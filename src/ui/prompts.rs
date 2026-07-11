@@ -195,6 +195,7 @@ pub enum SettingId {
     EditDefault,
     RepoScope,
     ShowHidden,
+    Mouse,
 }
 
 /// One row of the settings page, prebuilt by the app (label + rendered
@@ -1424,6 +1425,10 @@ fn render_help(f: &mut Frame, area: Rect, backdrop: Color, keys: &KeysConfig) {
             (k(KeyAction::Delete), "delete"),
             (k(KeyAction::CloseRuntime), "close process"),
             (k(KeyAction::Zoom), "zoom full-screen"),
+            (
+                format!("{} / {}", k(KeyAction::DiffView), kc(CtrlAction::ToggleDiff)),
+                "diff view (j/k · tab · a:scope)",
+            ),
         ],
     );
     let machines: Section = (

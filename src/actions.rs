@@ -28,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, bail};
 
+use crate::agent_events::{add_codex_tui_notifications, is_native_cli};
 use crate::config::{Config, RemoteConfig};
 use crate::types::{AgentKind, SessionMeta};
 
@@ -316,6 +317,11 @@ pub fn discover_codex_session_id_excluding(
         .unwrap_or_default();
     let mut last_index_check: Option<Instant> = None;
     let mut index_checks = 0_u32;
+    // Once a real index query succeeds it is authoritative, even when the
+    // new CLI row is not present yet. Falling through to a merely temporal
+    // rollout match at that point can claim a same-cwd subagent created by
+    // another Codex process while this child is still starting.
+    let mut index_authoritative = false;
     poll_until(deadline, CODEX_ROLLOUT_POLL, || {
         // Snapshotting a live WAL database is intentionally safer than a
         // direct open, but not free. Check twice around the startup race,
@@ -328,15 +334,26 @@ pub fn discover_codex_session_id_excluding(
         if last_index_check.is_none_or(|last| last.elapsed() >= index_interval) {
             last_index_check = Some(Instant::now());
             index_checks += 1;
-            if let Ok(Some(id)) = crate::discovery::codex::find_new_cli_thread_id(
-                cfg,
-                cwd,
-                spawned_after,
-                spawned_before,
-                excluded_ids,
-            ) {
-                return Some(id);
+            if crate::discovery::codex::has_thread_index(cfg) {
+                let source_aware = crate::discovery::codex::thread_index_is_source_aware(cfg);
+                match crate::discovery::codex::find_new_cli_thread_id(
+                    cfg,
+                    cwd,
+                    spawned_after,
+                    spawned_before,
+                    excluded_ids,
+                ) {
+                    Ok(Some(id)) => return Some(id),
+                    Ok(None) if source_aware => index_authoritative = true,
+                    Ok(None) => {}
+                    // An unreadable/drifted index gives no source evidence;
+                    // retain the rollout compatibility fallback.
+                    Err(_) => {}
+                }
             }
+        }
+        if index_authoritative {
+            return None;
         }
         scan_rollouts_once(
             &root,
@@ -472,14 +489,17 @@ fn read_first_line(path: &Path) -> Option<String> {
     Some(line)
 }
 
-/// Extract (cwd, id) from a rollout's session_meta line; defensive — any
-/// missing piece → None.
+/// Extract (cwd, id) from an interactive CLI rollout's session_meta line;
+/// defensive — any missing identity piece or explicit non-CLI source → None.
 fn parse_session_meta_line(line: &str) -> Option<(String, String, Option<SystemTime>)> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
     let payload = v.get("payload")?;
+    if !rollout_source_is_interactive_cli(payload) {
+        return None;
+    }
     let cwd = payload.get("cwd").and_then(|c| c.as_str())?.to_string();
     let id = payload
         .get("id")
@@ -496,6 +516,25 @@ fn parse_session_meta_line(line: &str) -> Option<(String, String, Option<SystemT
             .map(|t| SystemTime::from(t.with_timezone(&chrono::Utc)));
         Some((cwd, id.to_string(), timestamp))
     }
+}
+
+/// Legacy session_meta records predate both fields and remain eligible. When
+/// modern metadata is explicit, only a user-facing CLI (or its short-lived
+/// `unknown` bootstrap state) may identify the child Vag just launched.
+fn rollout_source_is_interactive_cli(payload: &serde_json::Value) -> bool {
+    let source_ok = match payload.get("source") {
+        None => true,
+        Some(serde_json::Value::String(source)) => matches!(source.as_str(), "cli" | "unknown"),
+        // Structured sources identify subagents; other scalar/null values
+        // are modern but provide no evidence of an interactive CLI.
+        Some(_) => false,
+    };
+    let thread_source_ok = match payload.get("thread_source") {
+        None => true,
+        Some(serde_json::Value::String(source)) => matches!(source.as_str(), "" | "user"),
+        Some(_) => false,
+    };
+    source_ok && thread_source_ok
 }
 
 /// Whole-second legacy timestamps compare at second precision; modern
@@ -697,13 +736,18 @@ pub fn remote_new_session_spec(
             ))
         }
         AgentKind::Codex => {
+            let command = remote.command_for(agent);
+            let mut args = Vec::new();
+            if is_native_cli(&command, AgentKind::Codex) {
+                add_codex_tui_notifications(&mut args);
+            }
             let id = format!(
                 "{}{}",
                 REMOTE_SYNTHETIC_PREFIX,
                 uuid::Uuid::new_v4().simple()
             );
             Ok((
-                remote_spec(remote, dir, &remote.command_for(agent), &[]),
+                remote_spec(remote, dir, &command, &args),
                 PendingId::Known(id),
             ))
         }
@@ -728,13 +772,17 @@ pub fn remote_resume_spec(
             remote.name
         );
     }
-    let args = match agent {
+    let command = remote.command_for(agent);
+    let mut args = match agent {
         AgentKind::Claude => vec!["--resume".to_string(), id.to_string()],
         AgentKind::Codex => vec!["resume".to_string(), id.to_string()],
         // Shell panes are ephemeral even on remotes — nothing to resume.
         AgentKind::Shell => bail!("shell panes are ephemeral — nothing to resume"),
     };
-    Ok(remote_spec(remote, cwd, &remote.command_for(agent), &args))
+    if agent == AgentKind::Codex && is_native_cli(&command, AgentKind::Codex) {
+        add_codex_tui_notifications(&mut args);
+    }
+    Ok(remote_spec(remote, cwd, &command, &args))
 }
 
 /// `cd` clause with `~` handled: `$HOME` sits OUTSIDE the single quotes so
@@ -802,6 +850,14 @@ mod tests {
         let script = &spec.args[5];
         assert!(script.starts_with("cd '/srv/x' && "), "{script}");
         assert!(script.contains("exec '/opt/codex'"), "{script}");
+        assert!(
+            script.contains("'tui.notification_method=\"osc9\"'"),
+            "{script}"
+        );
+        assert!(
+            script.contains("'tui.notification_condition=\"always\"'"),
+            "{script}"
+        );
         let PendingId::Known(id) = pending else {
             panic!()
         };
@@ -1303,6 +1359,152 @@ mod tests {
         let got =
             discover_codex_session_id(&cfg, &target, spawned_after, Duration::from_millis(100));
         assert_eq!(got.as_deref(), Some("id-legacy"));
+    }
+
+    #[test]
+    fn discover_codex_rollout_fallback_rejects_explicit_non_cli_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path(), tmp.path());
+        let target = tmp.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let day = today_dir(tmp.path());
+        std::fs::create_dir_all(&day).unwrap();
+        let launched = SystemTime::now() - Duration::from_secs(1);
+        let ts = |offset_ms| {
+            chrono::DateTime::<chrono::Utc>::from(launched + Duration::from_millis(offset_ms))
+                .to_rfc3339()
+        };
+        let write = |name: &str, payload: serde_json::Value| {
+            let line = serde_json::json!({
+                "type": "session_meta",
+                "payload": payload,
+            });
+            std::fs::write(day.join(name), format!("{line}\n")).unwrap();
+        };
+        write(
+            "rollout-subagent.jsonl",
+            serde_json::json!({
+                "id": "id-subagent",
+                "cwd": target.to_string_lossy(),
+                "timestamp": ts(10),
+                "source": {"subagent": {"thread_spawn": {"depth": 1}}},
+                "thread_source": "subagent",
+            }),
+        );
+        write(
+            "rollout-automation.jsonl",
+            serde_json::json!({
+                "id": "id-automation",
+                "cwd": target.to_string_lossy(),
+                "timestamp": ts(20),
+                "source": "cli",
+                "thread_source": "automation",
+            }),
+        );
+        write(
+            "rollout-app.jsonl",
+            serde_json::json!({
+                "id": "id-app",
+                "cwd": target.to_string_lossy(),
+                "timestamp": ts(30),
+                "source": "vscode",
+                "thread_source": "user",
+            }),
+        );
+        write(
+            "rollout-cli.jsonl",
+            serde_json::json!({
+                "id": "id-cli",
+                "cwd": target.to_string_lossy(),
+                "timestamp": ts(40),
+                "source": "unknown",
+                "thread_source": "user",
+            }),
+        );
+
+        let got = discover_codex_session_id_excluding(
+            &cfg,
+            &target,
+            launched,
+            Duration::from_millis(100),
+            &HashSet::new(),
+        );
+        assert_eq!(got.as_deref(), Some("id-cli"));
+        let got = discover_codex_session_id_excluding(
+            &cfg,
+            &target,
+            launched,
+            Duration::from_millis(50),
+            &HashSet::from(["id-cli".to_string()]),
+        );
+        assert!(got.is_none(), "no non-CLI rollout may be claimed");
+    }
+
+    #[test]
+    fn discover_codex_successful_index_query_suppresses_rollout_race() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path(), tmp.path());
+        let target = tmp.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, cwd TEXT, created_at_ms INTEGER, source TEXT
+            )",
+        )
+        .unwrap();
+        drop(conn);
+
+        // This legacy-looking rollout would be accepted when no usable
+        // index exists. A successful empty index query must make us wait for
+        // its authoritative CLI row instead of claiming the temporal match.
+        let day = today_dir(tmp.path());
+        write_rollout(
+            &day,
+            "rollout-racing.jsonl",
+            "id-racing",
+            &target.to_string_lossy(),
+            SystemTime::now(),
+        );
+        let got = discover_codex_session_id(
+            &cfg,
+            &target,
+            SystemTime::now() - Duration::from_secs(1),
+            Duration::from_millis(50),
+        );
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn discover_codex_legacy_index_keeps_rollout_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path(), tmp.path());
+        let target = tmp.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, cwd TEXT, created_at_ms INTEGER
+            )",
+        )
+        .unwrap();
+        drop(conn);
+
+        let day = today_dir(tmp.path());
+        write_rollout(
+            &day,
+            "rollout-legacy.jsonl",
+            "id-from-rollout",
+            &target.to_string_lossy(),
+            SystemTime::now(),
+        );
+        let got = discover_codex_session_id(
+            &cfg,
+            &target,
+            SystemTime::now() - Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
+        assert_eq!(got.as_deref(), Some("id-from-rollout"));
     }
 
     #[test]

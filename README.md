@@ -81,6 +81,10 @@ back to the tree — the agent keeps working. `?` shows every key.
   from the CLIs' own stores (`~/.claude`, `~/.codex`), grouped into **folders you define**.
   Session files are **never moved or edited** — organization lives in vag's own state
   file, so resume always works and agent CLI updates can't break your layout.
+- **Automatic archive** — unfiled Inbox sessions with no activity for more than three
+  days move into a built-in, collapsed **Archived** group and render dimmed. Opening or
+  externally running sessions stay in Inbox; this smart group is separate from Codex's
+  native `A` archive command and never changes an agent's store.
 - **The real CLIs, embedded** — opening a session runs the actual `claude --resume` /
   `codex resume` in a PTY and renders it in a pane. Inside the pane every key goes to the
   agent — including `ctrl-c` — except the detach hotkey.
@@ -89,9 +93,33 @@ back to the tree — the agent keeps working. `?` shows every key.
   archive (codex-native).
 - **Turn tracking** — switch away mid-turn and the tree shows what every session is doing:
   `⠹ working 4m32s` (animated) while a command is in flight, a bold `● done 2m` when a
-  turn finished while you weren't looking (cleared when you view it), `◌` idle, `✚` exited,
+  turn completed while you were away (cleared when viewed), `◌` idle, `✚` exited,
   and `▲ working 3m` for claude sessions running in *other* terminals (detected via
-  transcript activity). Timestamps refresh live.
+  transcript activity). Sessions launched by vag also use agent-native attention events:
+  local Claude sessions get session-scoped post-fact hooks for approvals, elicitations, and
+  an idle composer, and submitted/resumed prompts start the in-flight clock immediately;
+  Codex's native TUI notifications report completion, approvals, and plan prompts through
+  bounded OSC 9 messages, including over SSH. Vag never edits persisted agent settings to
+  enable this. Narrow rows reserve the full status (`done`, `approval`, `input`, etc.) before
+  truncating the session title. The live `working` timer is elapsed in-flight time; dashboard
+  agent totals remain a separate fresh-output activity metric so approval/user waits do not
+  inflate history.
+  The PTY activity tracker remains the fallback for custom wrappers, disabled hooks, remote
+  Claude, and external sessions. Timestamps refresh live.
+- **Per-session diff view** — every open session has a second tab: `D` (tree) or
+  `ctrl-g` (pane) flips between the live agent and a GitHub-style diff of what *that*
+  agent changed — a collapsible file tree (per-filetype icons in nerd mode) on the left,
+  the full diff on the right. The diff is live `git diff` against the commit that was
+  HEAD when vag first opened the session, scoped to the files the agent's own transcript
+  says it edited (`a` widens to the whole repo, `B` re-anchors the base to now). It
+  refreshes in real time: on every completed turn, whenever the transcript records a new
+  edit, and on a slow fallback that catches shell-made changes.
+  The body renders through **[delta](https://github.com/dandavison/delta)** when it's on
+  your PATH — syntax highlighting, word-level diffs, and your own delta config (themes,
+  `side-by-side`, `line-numbers`) apply as-is; without delta, vag's builtin renderer
+  (unified, line-number gutters) takes over. `brew install git-delta` to get the full
+  experience (the vag Homebrew formula pulls it in automatically); opt out or tune it
+  via `[diff]` in the config.
 - **Repo scoping** — launched inside a git repo, vag shows only that repo's sessions and
   folders by default (`g` toggles the cross-project view). A pinned `+ new session` row
   defaults new sessions to the repo root.
@@ -246,7 +274,9 @@ archive = "A"
 delete = "x"
 close = "w"
 zoom = "z"
+diff = "D"
 settings = ","
+toggle_diff = "ctrl-g"          # pane -> the session's diff view and back
 
 [agents.claude]
 command = "claude"              # binary name or path
@@ -284,6 +314,18 @@ theme = "night"                 # solid dark background (default). Also: "mocha"
 icons = "ascii"                 # or "nerd" | "auto" — auto detects common nerd-font terminals;
                                 # per run: `vag --icons nerd` or VAG_ICONS=nerd
 edit_default = false            # start the tree in vim edit mode
+mouse = true                    # wheel scrolls the pane's scrollback (or the tree);
+                                # clicking a pane focuses it; children that enable mouse
+                                # reporting (claude) get the events forwarded. Costs the
+                                # terminal's native drag-selection — hold Shift to select,
+                                # or turn this off (also toggleable from settings)
+
+[diff]
+use_delta = true                # render diff bodies through `delta` when it's on PATH
+                                # (syntax highlighting + your own delta/git config);
+                                # false — or delta missing — uses vag's builtin renderer
+delta_args = []                 # extra delta flags, appended last (they win), e.g.
+                                # ["--side-by-side"] or ["--syntax-theme", "GitHub"]
 
 [behavior]
 repo_scope = true               # scope to the current git repo by default when inside one (g toggles)
@@ -338,13 +380,22 @@ from the settings page (or the `[keys]` table); navigation keys are fixed.
 | `w` | close a session's process |
 | `space` | collapse folder |
 | `z` | zoom the active session full-screen |
+| `D` / `ctrl-g` | switch the session's tab: agent ⇄ **diff view** (what it changed). `ctrl-g` works from the sidebar, the agent pane, and the diff view alike, always landing in the pane. Inside the diff: `j`/`k` scroll, `ctrl-d`/`ctrl-u` half-page and `ctrl-f`/`ctrl-b`/pgup/pgdn full-page (vim-style), `tab` file-tree ⇄ diff, `enter` jump to file, `space` collapse dir, `g`/`G` top/bottom, `a` agent-files ⇄ whole repo, `r` refresh, `B` re-anchor base to HEAD, `ctrl-e` sidebar, `esc` back to the agent |
 | `1..9` | jump to open session |
 | `,` | open settings |
 | `end` | jump to the pinned `⚙ settings` row |
-| `pgup`/`pgdn` | scroll the active pane (from tree focus) |
+| `pgup`/`pgdn` | scroll the active pane's scrollback — works from tree focus AND pane focus (pane focus: intercepted only while the child is on the primary screen, so alt-screen apps like `vim` or codex's `ctrl+t` transcript overlay still get the keys; shift/ctrl-modified PgUp always reaches the child) |
+| mouse wheel | scroll whatever is under the pointer: pane scrollback (arrow keys are sent instead when the child is on the alt screen) or the tree. `ui.mouse = false` disables all mouse handling. While scrolled back, the titlebar shows `scroll ↑N`; any keypress snaps back to live |
 | `/` | filter |
 | `?` | help |
 | `q` | quit |
+
+### Mouse in tmux
+
+No configuration needed: vag requests mouse reporting from its host terminal, and tmux
+forwards mouse events to a pane whose program asked for them — with `mouse on` its default
+wheel binding sends through (`#{mouse_any_flag}`), with `mouse off` the modes pass through
+directly. Native text selection inside vag needs Shift+drag either way (or `ui.mouse = false`).
 
 ### tmux (vim-tmux-navigator users)
 

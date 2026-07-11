@@ -40,6 +40,14 @@ mod actions {
     }
 }
 
+// `RuntimeEvent` carries this in the real binary. The fidelity spike never
+// produces provider-native lifecycle events, so a shape-only stub keeps its
+// path-included runtime module decoupled from the application's bridge.
+mod agent_events {
+    #[derive(Debug, Clone)]
+    pub struct AgentEvent;
+}
+
 #[path = "../src/runtime/mod.rs"]
 mod runtime;
 

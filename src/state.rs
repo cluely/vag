@@ -70,6 +70,15 @@ pub struct SessionRef {
     pub last_opened: Option<DateTime<Utc>>,
     /// Set when a scan no longer finds the session; cleared when it reappears.
     pub missing_since: Option<DateTime<Utc>>,
+    /// HEAD sha when vag FIRST opened this session — the diff view's base
+    /// ("everything this agent changed since I started it"), surviving
+    /// restarts and the agent's own mid-run commits. Recorded alongside
+    /// last_opened, so it never affects is_default_uncustomized on its own.
+    pub base_commit: Option<String>,
+    /// When `base_commit` was recorded. The transcript scanner anchors its
+    /// touched-file attribution here, so the agent-files diff scope
+    /// survives vag restarts instead of resetting to the latest spawn.
+    pub base_recorded_at: Option<DateTime<Utc>>,
 }
 
 impl SessionRef {

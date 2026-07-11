@@ -168,6 +168,40 @@ fn find_state_db(home: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Whether Codex exposes a SQLite thread index that can authoritatively
+/// classify a fresh row's source. Rollout matching is intentionally only a
+/// fallback when this index is absent or unreadable.
+pub(crate) fn has_thread_index(cfg: &Config) -> bool {
+    find_state_db(&cfg.codex_home()).is_some()
+}
+
+/// A modern index can classify CLI vs app/subagent rows and is therefore
+/// authoritative even before the new row appears. Legacy indexes without a
+/// `source` column still need the provenance-filtered rollout fallback.
+pub(crate) fn thread_index_is_source_aware(cfg: &Config) -> bool {
+    let Some(db) = find_state_db(&cfg.codex_home()) else {
+        return false;
+    };
+    let Ok(conn) = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let Ok(mut stmt) = conn.prepare("PRAGMA table_info(threads)") else {
+        return false;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return false;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        if row.get::<_, String>(1).ok().as_deref() == Some("source") {
+            return true;
+        }
+    }
+    false
+}
+
 fn scan_sqlite(db: &Path, show_automation: bool) -> Result<Vec<SessionMeta>> {
     let tmp = tempfile::tempdir().context("creating snapshot temp dir")?;
     let snapshot = snapshot_db(db, tmp.path())?;
@@ -220,13 +254,19 @@ pub(crate) fn find_new_cli_thread_id(
 
     let mut best: Option<(i64, String)> = None;
     for row in rows {
-        // `source` was added after the first SQLite schema. Missing means
-        // "unknown/legacy" and remains eligible; explicit subagent/app
-        // sources must not steal an interactive CLI launch.
-        if !matches!(row.source.as_deref(), None | Some("cli")) {
+        // A schema with no `source` column is legacy and remains eligible.
+        // In modern schemas, however, NULL/blank is not proof of a CLI
+        // launch: app-server and subagent rows can be incomplete while they
+        // are first inserted. `unknown` is Codex's explicit early state for
+        // a fresh interactive thread and is promoted to `cli` shortly after.
+        if !identity_source_is_cli(&row) {
             continue;
         }
-        if is_noise(&row) {
+        // Dashboard discovery may keep automation threads that a user later
+        // interacted with (`has_user_event=1`). Launch identity must be
+        // stricter: explicit automation/subagent provenance can never belong
+        // to the interactive CLI process Vag just spawned.
+        if !matches!(row.thread_source.as_deref(), None | Some("user")) {
             continue;
         }
         let Some(candidate_cwd) = row.cwd.as_deref() else {
@@ -252,6 +292,13 @@ pub(crate) fn find_new_cli_thread_id(
         }
     }
     Ok(best.map(|(_, id)| id))
+}
+
+fn identity_source_is_cli(row: &ThreadRow) -> bool {
+    if !row.source_column_present {
+        return true;
+    }
+    matches!(row.source.as_deref(), Some("cli") | Some("unknown"))
 }
 
 fn row_created_in_launch_window(
@@ -312,6 +359,7 @@ fn query_identity_rows(db: &Path, read_only: bool) -> Result<Vec<ThreadRow>> {
     if !have.contains("created_at") && !have.contains("created_at_ms") {
         anyhow::bail!("threads table missing creation timestamp");
     }
+    let source_column_present = have.contains("source");
 
     const WANTED: [&str; 7] = [
         "id",
@@ -347,6 +395,7 @@ fn query_identity_rows(db: &Path, read_only: bool) -> Result<Vec<ThreadRow>> {
             thread_source: s("thread_source"),
             has_user_event: n("has_user_event"),
             source: s("source"),
+            source_column_present,
             ..ThreadRow::default()
         });
     }
@@ -392,6 +441,9 @@ struct ThreadRow {
     has_user_event: Option<i64>,
     git_branch: Option<String>,
     source: Option<String>,
+    /// Distinguishes a genuinely legacy schema (no `source` column) from a
+    /// modern row whose source is temporarily or permanently NULL/blank.
+    source_column_present: bool,
 }
 
 /// Open a *snapshot copy* and read the threads table. Read-write open on
@@ -466,6 +518,7 @@ fn query_threads(snapshot: &Path) -> Result<Vec<ThreadRow>> {
             has_user_event: n("has_user_event"),
             git_branch: s("git_branch"),
             source: s("source"),
+            source_column_present: idx.contains_key("source"),
         });
     }
     Ok(out)
@@ -1078,6 +1131,121 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        let launch = UNIX_EPOCH + Duration::from_millis(launch_ms as u64);
+        assert_eq!(
+            find_new_cli_thread_id(
+                &fx.cfg,
+                &cwd,
+                launch,
+                launch + Duration::from_secs(60),
+                &HashSet::new(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(id.as_str())
+        );
+    }
+
+    #[test]
+    fn id_lookup_accepts_unknown_but_rejects_modern_unclassified_sources() {
+        let fx = fixture();
+        let db = fx.home.join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(FULL_SCHEMA).unwrap();
+        let cwd = fx.home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let launch_ms = 20_000_i64;
+        let launch = UNIX_EPOCH + Duration::from_millis(launch_ms as u64);
+
+        let null_source = uid(1);
+        let structured = uid(2);
+        let app = uid(3);
+        let automation = uid(4);
+        let unknown = uid(5);
+        let cli = uid(6);
+        for (id, created_ms, source, thread_source, has_user_event) in [
+            (&null_source, 20_010, None, "user", 0),
+            (
+                &structured,
+                20_020,
+                Some(r#"{"subagent":{}}"#),
+                "subagent",
+                0,
+            ),
+            (&app, 20_030, Some("vscode"), "user", 1),
+            (&automation, 20_035, Some("cli"), "automation", 1),
+            (&unknown, 20_040, Some("unknown"), "user", 0),
+            (&cli, 20_050, Some("cli"), "user", 0),
+        ] {
+            conn.execute(
+                "INSERT INTO threads
+                 (id, rollout_path, cwd, created_at_ms, thread_source,
+                  has_user_event, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    id,
+                    fx.home
+                        .join(format!("missing-{id}.jsonl"))
+                        .to_str()
+                        .unwrap(),
+                    cwd.to_str().unwrap(),
+                    created_ms,
+                    thread_source,
+                    has_user_event,
+                    source,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        assert_eq!(
+            find_new_cli_thread_id(
+                &fx.cfg,
+                &cwd,
+                launch,
+                launch + Duration::from_secs(60),
+                &HashSet::new(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(unknown.as_str())
+        );
+        assert_eq!(
+            find_new_cli_thread_id(
+                &fx.cfg,
+                &cwd,
+                launch,
+                launch + Duration::from_secs(60),
+                &HashSet::from([unknown]),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(cli.as_str())
+        );
+    }
+
+    #[test]
+    fn id_lookup_accepts_legacy_schema_without_source_column() {
+        let fx = fixture();
+        let conn = Connection::open(fx.home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, cwd TEXT, created_at_ms INTEGER
+            )",
+        )
+        .unwrap();
+        let cwd = fx.home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let launch_ms = 30_000_i64;
+        let id = uid(6);
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, cwd.to_str().unwrap(), launch_ms + 10],
+        )
+        .unwrap();
+        drop(conn);
+
         let launch = UNIX_EPOCH + Duration::from_millis(launch_ms as u64);
         assert_eq!(
             find_new_cli_thread_id(

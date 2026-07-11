@@ -25,6 +25,50 @@
 
 use std::time::{Duration, Instant};
 
+/// A parsed SGR mouse report (`ESC [ < btn ; col ; row M|m`). vag only ever
+/// enables SGR encoding (DECSET 1006) on the host, so this is the sole wire
+/// format the gate has to understand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    /// Raw SGR button code (low 2 bits = button, 4/8/16 = modifiers,
+    /// 32 = motion, 64 = wheel).
+    pub btn: u16,
+    /// 1-based host-terminal cell coordinates.
+    pub col: u16,
+    pub row: u16,
+    /// true for press/wheel (`M`), false for release (`m`).
+    pub press: bool,
+}
+
+impl MouseEvent {
+    /// +1 = wheel up (back in history), -1 = wheel down, regardless of
+    /// modifier bits. Wheel left/right (btn&3 == 2/3) is not a scroll.
+    pub fn wheel(&self) -> Option<i32> {
+        match (self.btn & 64 != 0, self.btn & 3) {
+            (true, 0) => Some(1),
+            (true, 1) => Some(-1),
+            _ => None,
+        }
+    }
+
+    /// Motion flag: drag (with MOUSE_DRAG) or plain movement (MOUSE_MOTION).
+    pub fn is_motion(&self) -> bool {
+        self.btn & 64 == 0 && self.btn & 32 != 0
+    }
+
+    /// Left button press (not motion, not wheel): the "click" chrome acts on.
+    pub fn is_left_press(&self) -> bool {
+        self.press && self.btn & (64 | 32) == 0 && self.btn & 3 == 0
+    }
+
+    /// Re-encode as an SGR report with translated (1-based) coordinates,
+    /// for forwarding into a child that enabled SGR mouse mode itself.
+    pub fn encode_sgr(&self, col: u16, row: u16) -> Vec<u8> {
+        let fin = if self.press { 'M' } else { 'm' };
+        format!("\x1b[<{};{};{}{}", self.btn, col, row, fin).into_bytes()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
     Char(char),
@@ -352,6 +396,161 @@ impl Parser {
     }
 }
 
+/// Longest sane SGR mouse report: `ESC [ <` + 3 params + final ≈ 20 bytes.
+/// Anything that grows past this is not a mouse report — flush it verbatim.
+const MOUSE_MAX: usize = 24;
+const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// Extracts SGR mouse reports (`ESC [ < b ; x ; y M|m`) from the raw stdin
+/// stream, passing every other byte through VERBATIM. Runs BEFORE both input
+/// paths (chrome parser and raw pane forwarding), so mouse bytes never leak
+/// into a child as garbage and never reach the chrome parser at all.
+///
+/// Byte-perfect passthrough rules:
+/// - Only an unambiguous mouse prefix (`ESC [ <` …) is ever held across
+///   chunk boundaries. A chunk ending in a bare ESC or `ESC [` is flushed
+///   as-is: those are (or start) real keystrokes that must not be delayed,
+///   and mouse reports arrive atomically from the terminal driver, so a
+///   report torn exactly there is vanishingly rare.
+/// - Host bracketed paste suspends extraction: pasted content that happens
+///   to contain literal mouse-report bytes stays content. (A paste-start
+///   marker split across reads evades this detection — accepted, the
+///   double-rarity makes it noise.)
+#[derive(Debug, Default)]
+pub struct MouseGate {
+    /// Held candidate bytes: a strict prefix of `ESC [ <…` (cross-chunk) or
+    /// an in-chunk `ESC…` prefix still being classified.
+    partial: Vec<u8>,
+    /// Inside host bracketed paste (passthrough until PASTE_END).
+    in_paste: bool,
+    /// Bytes of PASTE_END matched at the tail of the passthrough stream.
+    paste_end_matched: usize,
+}
+
+impl MouseGate {
+    /// Split `bytes` into extracted mouse events and the passthrough rest.
+    pub fn feed(&mut self, bytes: &[u8]) -> (Vec<MouseEvent>, Vec<u8>) {
+        let mut events = Vec::new();
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            self.step(b, &mut events, &mut out);
+        }
+        // Chunk boundary: keep only an unambiguous mouse prefix pending.
+        if !self.partial.is_empty() && !self.partial.starts_with(b"\x1b[<") {
+            out.extend_from_slice(&self.partial);
+            self.partial.clear();
+        }
+        (events, out)
+    }
+
+    /// Drop any held state (pane switch / zoom transitions).
+    pub fn reset(&mut self) {
+        self.partial.clear();
+        self.in_paste = false;
+        self.paste_end_matched = 0;
+    }
+
+    fn step(&mut self, b: u8, events: &mut Vec<MouseEvent>, out: &mut Vec<u8>) {
+        if self.in_paste {
+            out.push(b);
+            self.paste_end_matched = if b == PASTE_END[self.paste_end_matched] {
+                self.paste_end_matched + 1
+            } else if b == PASTE_END[0] {
+                1
+            } else {
+                0
+            };
+            if self.paste_end_matched == PASTE_END.len() {
+                self.in_paste = false;
+                self.paste_end_matched = 0;
+            }
+            return;
+        }
+        if self.partial.is_empty() {
+            if b == ESC {
+                self.partial.push(b);
+            } else {
+                out.push(b);
+            }
+            return;
+        }
+        // Growing a candidate. Valid continuations: "[", then "<", then
+        // params/final. Paste-start detection rides along: PASTE_START also
+        // begins ESC [ — match it before giving up on non-mouse sequences.
+        self.partial.push(b);
+        let p = &self.partial[..];
+        let still_mouse = match p.len() {
+            2 => b == b'[',
+            3 => b == b'<' || PASTE_START.starts_with(p),
+            _ if p.starts_with(b"\x1b[<") => {
+                if matches!(b, b'M' | b'm') {
+                    let ev = parse_sgr_body(&p[3..p.len() - 1], b == b'M');
+                    match ev {
+                        Some(ev) => events.push(ev),
+                        // Malformed params: pass the whole thing through.
+                        None => out.extend_from_slice(p),
+                    }
+                    self.partial.clear();
+                    return;
+                }
+                (b.is_ascii_digit() || b == b';') && p.len() < MOUSE_MAX
+            }
+            _ if PASTE_START.starts_with(p) => {
+                if p == PASTE_START {
+                    out.extend_from_slice(p);
+                    self.partial.clear();
+                    self.in_paste = true;
+                    return;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !still_mouse {
+            // ESC aborting the candidate starts a NEW candidate; everything
+            // else flushes verbatim (order preserved: candidate then byte).
+            let flushed: Vec<u8> = self.partial.drain(..).collect();
+            if b == ESC {
+                out.extend_from_slice(&flushed[..flushed.len() - 1]);
+                self.partial.push(ESC);
+            } else {
+                out.extend_from_slice(&flushed);
+            }
+        }
+    }
+}
+
+/// Parse `b;x;y` from an SGR report body (final byte already stripped).
+fn parse_sgr_body(body: &[u8], press: bool) -> Option<MouseEvent> {
+    let mut it = body.split(|&c| c == b';');
+    let num = |it: &mut dyn Iterator<Item = &[u8]>| -> Option<u16> {
+        let part = it.next()?;
+        if part.is_empty() || part.len() > 5 {
+            return None;
+        }
+        let mut v: u32 = 0;
+        for &c in part {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as u32;
+        }
+        u16::try_from(v).ok()
+    };
+    let btn = num(&mut it)?;
+    let col = num(&mut it)?;
+    let row = num(&mut it)?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(MouseEvent {
+        btn,
+        col,
+        row,
+        press,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +855,144 @@ mod tests {
         seq.push(b'm');
         seq.push(b'z');
         assert_eq!(feed_one(&seq), vec![Key::Char('z')]);
+    }
+
+    // ---------- MouseGate ----------
+
+    fn gate_one(bytes: &[u8]) -> (Vec<MouseEvent>, Vec<u8>) {
+        MouseGate::default().feed(bytes)
+    }
+
+    #[test]
+    fn mouse_gate_extracts_report_and_passes_rest_verbatim() {
+        let (evs, rest) = gate_one(b"ab\x1b[<64;10;5Mcd");
+        assert_eq!(
+            evs,
+            vec![MouseEvent {
+                btn: 64,
+                col: 10,
+                row: 5,
+                press: true
+            }]
+        );
+        assert_eq!(rest, b"abcd");
+    }
+
+    #[test]
+    fn mouse_gate_release_report() {
+        let (evs, rest) = gate_one(b"\x1b[<0;3;4m");
+        assert_eq!(
+            evs,
+            vec![MouseEvent {
+                btn: 0,
+                col: 3,
+                row: 4,
+                press: false
+            }]
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn mouse_gate_report_split_across_chunks() {
+        let mut g = MouseGate::default();
+        let (evs, rest) = g.feed(b"x\x1b[<6");
+        assert!(evs.is_empty());
+        assert_eq!(rest, b"x", "unambiguous mouse prefix is held");
+        let (evs, rest) = g.feed(b"5;7;8My");
+        assert_eq!(
+            evs,
+            vec![MouseEvent {
+                btn: 65,
+                col: 7,
+                row: 8,
+                press: true
+            }]
+        );
+        assert_eq!(rest, b"y");
+    }
+
+    #[test]
+    fn mouse_gate_keyboard_sequences_pass_untouched() {
+        for seq in [
+            &b"\x1b[A"[..],
+            b"\x1b[5~",
+            b"\x1b[1;5C",
+            b"\x1bOA",
+            b"\x1bq",
+            b"\x1b\x1b",
+            b"plain text",
+        ] {
+            let (evs, rest) = gate_one(seq);
+            assert!(evs.is_empty(), "{seq:?}");
+            assert_eq!(rest, seq, "byte-perfect passthrough for {seq:?}");
+        }
+    }
+
+    #[test]
+    fn mouse_gate_lone_esc_not_delayed() {
+        // A chunk ending in bare ESC (or ESC [) flushes immediately — the
+        // chrome parser owns lone-ESC disambiguation, not the gate.
+        let mut g = MouseGate::default();
+        let (_, rest) = g.feed(b"\x1b");
+        assert_eq!(rest, b"\x1b");
+        let (_, rest) = g.feed(b"\x1b[");
+        assert_eq!(rest, b"\x1b[");
+    }
+
+    #[test]
+    fn mouse_gate_paste_content_is_immune() {
+        let seq = b"\x1b[200~a\x1b[<64;1;1Mb\x1b[201~\x1b[<64;1;1M";
+        let (evs, rest) = gate_one(seq);
+        // Only the report AFTER the paste closes is extracted.
+        assert_eq!(evs.len(), 1);
+        assert_eq!(rest, b"\x1b[200~a\x1b[<64;1;1Mb\x1b[201~");
+    }
+
+    #[test]
+    fn mouse_gate_malformed_report_passes_verbatim() {
+        for seq in [&b"\x1b[<64;;5M"[..], b"\x1b[<64;10M", b"\x1b[<;1;1M"] {
+            let (evs, rest) = gate_one(seq);
+            assert!(evs.is_empty(), "{seq:?}");
+            assert_eq!(rest, seq);
+        }
+    }
+
+    #[test]
+    fn mouse_gate_overlong_candidate_flushes() {
+        let mut seq = b"\x1b[<".to_vec();
+        seq.extend(std::iter::repeat_n(b'1', 40));
+        let (evs, rest) = gate_one(&seq);
+        assert!(evs.is_empty());
+        assert_eq!(rest, seq);
+    }
+
+    #[test]
+    fn mouse_event_classification() {
+        let ev = |btn| MouseEvent {
+            btn,
+            col: 1,
+            row: 1,
+            press: true,
+        };
+        assert_eq!(ev(64).wheel(), Some(1)); // wheel up
+        assert_eq!(ev(65).wheel(), Some(-1)); // wheel down
+        assert_eq!(ev(68).wheel(), Some(1)); // shift+wheel up
+        assert_eq!(ev(66).wheel(), None); // wheel left
+        assert_eq!(ev(0).wheel(), None);
+        assert!(ev(0).is_left_press());
+        assert!(!ev(1).is_left_press()); // middle
+        assert!(!ev(32).is_left_press()); // drag motion
+        assert!(ev(32).is_motion());
+        assert!(!ev(64).is_motion());
+        let rel = MouseEvent {
+            btn: 0,
+            col: 1,
+            row: 1,
+            press: false,
+        };
+        assert!(!rel.is_left_press());
+        assert_eq!(ev(65).encode_sgr(12, 3), b"\x1b[<65;12;3M");
+        assert_eq!(rel.encode_sgr(1, 1), b"\x1b[<0;1;1m");
     }
 }

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use alacritty_terminal::term::TermMode;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{cursor, event as ctevent, execute, terminal};
 use ratatui::backend::CrosstermBackend;
@@ -23,18 +23,29 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::actions::{self, PendingId};
+use crate::agent_events::{
+    AgentEvent, AgentEventKind, AgentEventListener, add_codex_tui_notifications,
+    instrument_claude, is_native_cli, normalize_codex_notification, now_unix_nanos,
+};
 use crate::config::{
     Config, CtrlAction, DetachKey, IconMode, KeyAction, PaneStyle, RemoteConfig, TreeMode,
 };
 use crate::discovery::{self, ScanResult, claude::RunningClaude};
+use crate::gitdiff::{self, DiffSnapshot};
 use crate::runtime::{PaneSize, RuntimeEvent, SessionRuntime};
 use crate::state::VagState;
+use crate::stats::ActivityStats;
+use crate::touched::TranscriptScanner;
 use crate::types::{AgentKind, SessionKey, SessionMeta};
 use crate::ui::activity::{Activity, Turn};
-use crate::ui::dashboard::{self, Badge, BadgeInfo, INBOX_ID, Row, RowCtx, machine_collapse_key};
+use crate::ui::dashboard::{
+    self, ARCHIVED_ID, Badge, BadgeInfo, INBOX_ID, Row, RowCtx, machine_collapse_key,
+};
+use crate::ui::diffview::{self, DiffFocus, DiffView, RepoCtx};
 use crate::ui::editbuf::{EditAction, EditBuf, EditEvent, EditLine, LineId, Mode as EditMode};
+use crate::ui::heatmap;
 use crate::ui::icons::Icons;
-use crate::ui::input::{Key, Parser};
+use crate::ui::input::{Key, MouseEvent, MouseGate, Parser};
 use crate::ui::pane;
 use crate::ui::prompts::{
     BindTarget, Commit, DirPick, DirTarget, InputKind, LineEdit, LocationChoice, Modal, Outcome,
@@ -50,6 +61,18 @@ const STATUS_TTL: Duration = Duration::from_secs(5);
 const DISCOVER_DEADLINE: Duration = Duration::from_secs(20);
 /// A scan that hasn't reported back after this long is presumed lost.
 const SCAN_STUCK_AFTER: Duration = Duration::from_secs(60);
+/// Persisted activity stats are batched in memory and written this often
+/// (plus once more on quit) — keeps disk IO off the 100ms tick hot path.
+const STATS_FLUSH_EVERY: Duration = Duration::from_secs(30);
+/// Transcript-tail poll cadence for the touched-file scanners (a stat()
+/// per open runtime; parsing only happens on growth).
+const DIFF_POLL_EVERY: Duration = Duration::from_secs(1);
+/// Visible-diff fallback refresh: catches edits with no transcript record
+/// (Bash/sed/formatters) and anything a missed native event would drop.
+const DIFF_VISIBLE_REFRESH: Duration = Duration::from_secs(2);
+/// A diff worker that hasn't reported back after this long is presumed
+/// lost; the in-flight guard is released so refreshes can resume.
+const DIFF_STUCK_AFTER: Duration = Duration::from_secs(30);
 
 enum AppEvent {
     Stdin(Vec<u8>),
@@ -75,6 +98,15 @@ enum AppEvent {
         dirs: Vec<String>,
         done: bool,
     },
+    /// A background `git diff` finished for one session's diff view.
+    /// `generation` pairs the reply with the request that spawned it —
+    /// stale replies are dropped. The optional delta render rides along
+    /// (None = delta missing/disabled/failed → builtin body).
+    DiffDone {
+        key: SessionKey,
+        generation: u64,
+        result: Result<(DiffSnapshot, Option<diffview::DeltaOutput>), String>,
+    },
     Resize,
     Tick,
 }
@@ -96,12 +128,28 @@ struct PendingCtx {
     /// critical: Codex can defer its rollout until the first turn finishes.
     cwd: PathBuf,
     spawned_after: SystemTime,
+    /// Lower bound used by the Codex identity resolver. Starts at process
+    /// launch; after a long blank pause it advances to the first input so a
+    /// prompt-deferred identity is not excluded by the launch-time window.
+    codex_search_after: SystemTime,
     /// Candidate ids proven to belong to another open runtime. Discovery
     /// retries skip them so concurrent same-directory launches converge.
     excluded_ids: HashSet<String>,
+    /// At most one identity worker per provisional runtime. A blank Codex
+    /// pane may have no durable thread yet; after the initial window we wait
+    /// for pane input instead of hot-polling forever.
+    discovering: bool,
+    /// Once the user has sent input, identity is expected to materialize and
+    /// bounded lookup windows may continue until it does. Untouched blank
+    /// panes leave this false and therefore do not poll forever.
+    input_sent: bool,
     /// The pane closed while discovery was in flight. Keep a non-rendered
     /// tombstone so a final successful result can still persist name/folder.
     closed: bool,
+    /// Base sha captured at spawn. Travels with the provisional key so a
+    /// pane closed before id resolution still persists its first-open base
+    /// (diff_repo is cleaned on close; this tombstone copy survives).
+    base: Option<String>,
 }
 
 impl PendingCtx {
@@ -114,14 +162,24 @@ impl PendingCtx {
                 .map(str::to_string),
             cwd: PathBuf::new(),
             spawned_after: SystemTime::UNIX_EPOCH,
+            codex_search_after: SystemTime::UNIX_EPOCH,
             excluded_ids: HashSet::new(),
+            discovering: false,
+            input_sent: false,
             closed: false,
+            base: None,
         }
     }
 }
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
+const ESC_BYTE: u8 = 0x1b;
+const PANE_ESC_QUIET: Duration = Duration::from_millis(50);
+/// Plain (unmodified) PgUp/PgDn — shift/ctrl variants (`ESC[5;2~`…) still
+/// reach the child.
+const PAGE_UP: &[u8] = b"\x1b[5~";
+const PAGE_DOWN: &[u8] = b"\x1b[6~";
 
 /// Bracketed-paste tracker for the raw pane-input path.
 ///
@@ -177,6 +235,7 @@ enum RowAnchor {
     Session(SessionKey),
     Folder(String),
     Inbox,
+    Archived,
     Machine(String),
     /// The empty-state row under a folder (anchored by that folder's id).
     Empty(Option<String>),
@@ -189,6 +248,7 @@ fn row_anchor(row: &Row) -> RowAnchor {
         Row::Session { key, .. } => RowAnchor::Session(key.clone()),
         Row::Folder { id, .. } => RowAnchor::Folder(id.clone()),
         Row::Inbox { .. } => RowAnchor::Inbox,
+        Row::Archived { .. } => RowAnchor::Archived,
         Row::Machine { name, .. } => RowAnchor::Machine(name.clone()),
         Row::Empty { folder, .. } => RowAnchor::Empty(folder.clone()),
     }
@@ -229,8 +289,16 @@ type Backend = CrosstermBackend<std::io::Stdout>;
 /// panic hook is installed in `run`).
 struct TermGuard;
 
+/// vag's own mouse reporting on the REAL terminal: clicks+wheel (1000),
+/// drag (1002), SGR encoding (1006). Never 1003 — motion-without-buttons
+/// floods stdin for nothing. Enabled raw (not crossterm's
+/// EnableMouseCapture, which also turns on 1003/1015): stdin is parsed by
+/// vag's own MouseGate, so only the modes it understands go on.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
 impl TermGuard {
-    fn setup() -> Result<TermGuard> {
+    fn setup(mouse: bool) -> Result<TermGuard> {
         terminal::enable_raw_mode().context("enabling raw mode")?;
         execute!(
             std::io::stdout(),
@@ -239,12 +307,20 @@ impl TermGuard {
             cursor::Hide
         )
         .context("terminal setup")?;
+        if mouse {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(MOUSE_ON);
+            let _ = out.flush();
+        }
         Ok(TermGuard)
     }
 
     fn restore() {
+        let mut out = std::io::stdout();
+        // Unconditional: harmless when mouse was never enabled.
+        let _ = out.write_all(MOUSE_OFF);
         let _ = execute!(
-            std::io::stdout(),
+            out,
             ctevent::DisableBracketedPaste,
             terminal::LeaveAlternateScreen,
             cursor::Show
@@ -262,6 +338,10 @@ impl Drop for TermGuard {
 pub fn run() -> Result<()> {
     let cfg = Config::load()?;
     let state = VagState::load()?;
+    let activity_stats = ActivityStats::load().unwrap_or_else(|e| {
+        eprintln!("vag: activity stats unreadable ({e:#}); starting fresh");
+        ActivityStats::default()
+    });
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -269,7 +349,7 @@ pub fn run() -> Result<()> {
         default_hook(info);
     }));
 
-    let _guard = TermGuard::setup()?;
+    let _guard = TermGuard::setup(cfg.ui.mouse)?;
     let mut term =
         Terminal::new(CrosstermBackend::new(std::io::stdout())).context("creating terminal")?;
 
@@ -278,7 +358,7 @@ pub fn run() -> Result<()> {
     spawn_winch_pump(tx.clone());
     spawn_tick_pump(tx.clone());
 
-    let mut app = App::new(cfg, state, tx);
+    let mut app = App::new(cfg, state, activity_stats, tx);
     app.request_scan();
     app.refresh_external();
 
@@ -364,6 +444,17 @@ fn tree_mode_name(t: TreeMode) -> &'static str {
     }
 }
 
+/// Semantic boundary carried by one raw pane-input batch. Submit and cancel
+/// both dismiss a native attention latch, but only submit proves that agent
+/// work should resume immediately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PaneAttentionAction {
+    #[default]
+    None,
+    Submit,
+    Cancel,
+}
+
 /// Push a theme's pane colors into the two process-wide slots: the pane
 /// painter's default fg/bg and the emulator's OSC 10/11 answers. Called at
 /// startup and again on every in-app theme switch (both are RwLocks).
@@ -416,6 +507,13 @@ struct App {
     filter_edit: Option<LineEdit>,
 
     runtimes: HashMap<SessionKey, SessionRuntime>,
+    /// Private provider-native event socket for local Claude hook packets.
+    /// None is a supported fallback: PTY activity tracking remains active.
+    agent_events: Option<AgentEventListener>,
+    /// Private merged Claude settings file owned by each live runtime.
+    agent_settings: HashMap<SessionKey, PathBuf>,
+    /// Absolute helper executable placed in Claude's session-only hook args.
+    agent_event_helper: Option<PathBuf>,
     open_order: Vec<SessionKey>,
     active: Option<SessionKey>,
     exited: HashSet<SessionKey>,
@@ -453,6 +551,16 @@ struct App {
     last_pane_rect: Option<Rect>,
     /// Bracketed-paste framing of the bytes forwarded to the active pane.
     pane_paste: PasteGate,
+    /// A trailing ESC already forwarded to the child. If no continuation
+    /// arrives within the ambiguity window, it was a dialog cancellation.
+    pane_attention_escape: Option<(SessionKey, Instant, u64)>,
+    /// Extracts SGR mouse reports from raw stdin (ui.mouse = true).
+    mouse_gate: MouseGate,
+    /// A forwarded button press went into the pane and its release hasn't
+    /// arrived yet: route motion/release there (clamped) even if the
+    /// pointer wanders over the sidebar, so the child never sees a stuck
+    /// button.
+    mouse_down_in_pane: bool,
     /// codex archive/unarchive shell-outs currently running on workers.
     archive_in_flight: HashSet<SessionKey>,
     /// Current directory-picker walk; batches from older walks are dropped.
@@ -471,9 +579,30 @@ struct App {
     activity: HashMap<SessionKey, Activity>,
     /// Last user-input write per open runtime (echo-grace for the tracker).
     last_input_at: HashMap<SessionKey, Instant>,
+    /// Per-session diff tab state (lazily created on first toggle).
+    diff_views: HashMap<SessionKey, DiffView>,
+    /// Git root + base sha captured at each runtime's spawn boundary.
+    diff_repo: HashMap<SessionKey, RepoCtx>,
+    /// Incremental transcript tails feeding each runtime's touched-file set.
+    diff_scanners: HashMap<SessionKey, TranscriptScanner>,
+    /// Sessions with a `git diff` worker currently running.
+    diff_in_flight: HashSet<SessionKey>,
+    /// Last transcript-tail poll (1s cadence off the 100ms tick).
+    last_diff_poll: Instant,
     /// working-since per externally-running claude session id (transcript
     /// mtime freshness observed by refresh_external).
     ext_working: HashMap<String, Instant>,
+
+    /// Historical daily active time per agent (persisted, survives
+    /// restarts) — fed by `Activity::observe()`'s credited-delta return.
+    /// Source for the dashboard's activity heatmap and totals.
+    activity_stats: ActivityStats,
+    /// Set when `activity_stats` has unsaved in-memory deltas.
+    stats_dirty: bool,
+    /// Last time `activity_stats` was written to disk — flushed on this
+    /// cadence rather than every tick (100ms) to keep disk IO off the hot
+    /// path; a final flush also happens on quit (see `shutdown`).
+    stats_last_flush: Instant,
 
     /// ui.edit_default: enter edit mode after the first successful scan
     /// (armed once at startup, disarmed on the first attempt).
@@ -485,7 +614,12 @@ struct App {
 }
 
 impl App {
-    fn new(cfg: Config, state: VagState, tx: Sender<AppEvent>) -> App {
+    fn new(
+        cfg: Config,
+        state: VagState,
+        activity_stats: ActivityStats,
+        tx: Sender<AppEvent>,
+    ) -> App {
         let show_hidden = cfg.behavior.show_hidden;
         let icons = Icons::for_mode(cfg.ui.icons);
         let theme = Theme::from_config(&cfg);
@@ -501,6 +635,12 @@ impl App {
         // Honor behavior.repo_scope: launched inside a repo, the tree scopes
         // to it by default only when the config says so (g still toggles).
         let scoped = scope_root.is_some() && cfg.behavior.repo_scope;
+        let agent_events = AgentEventListener::bind()
+            .map_err(|e| eprintln!("vag: native agent events unavailable ({e})"))
+            .ok();
+        let agent_event_helper = std::env::current_exe()
+            .map_err(|e| eprintln!("vag: cannot locate native-event helper ({e})"))
+            .ok();
         App {
             cfg,
             state,
@@ -515,13 +655,18 @@ impl App {
             warnings: vec![],
             rows: vec![],
             cursor: 0,
-            collapsed: HashSet::new(),
+            // The automatic Archived smart folder starts closed on every
+            // launch; removing this key is the runtime-only expanded state.
+            collapsed: HashSet::from([ARCHIVED_ID.to_string()]),
             show_hidden,
             scoped,
             scope_root,
             filter: None,
             filter_edit: None,
             runtimes: HashMap::new(),
+            agent_events,
+            agent_settings: HashMap::new(),
+            agent_event_helper,
             open_order: vec![],
             active: None,
             exited: HashSet::new(),
@@ -539,6 +684,9 @@ impl App {
             last_detach: None,
             last_pane_rect: None,
             pane_paste: PasteGate::default(),
+            pane_attention_escape: None,
+            mouse_gate: MouseGate::default(),
+            mouse_down_in_pane: false,
             archive_in_flight: HashSet::new(),
             dir_scan_id: 0,
             external_claude: HashMap::new(),
@@ -549,7 +697,15 @@ impl App {
             last_time_paint: Instant::now(),
             activity: HashMap::new(),
             last_input_at: HashMap::new(),
+            diff_views: HashMap::new(),
+            diff_repo: HashMap::new(),
+            diff_scanners: HashMap::new(),
+            diff_in_flight: HashSet::new(),
+            last_diff_poll: Instant::now(),
             ext_working: HashMap::new(),
+            activity_stats,
+            stats_dirty: false,
+            stats_last_flush: Instant::now(),
             edit_default_pending,
             status: None,
             dirty: true,
@@ -598,6 +754,12 @@ impl App {
         for h in handles {
             let _ = h.join();
         }
+        for (_, path) in self.agent_settings.drain() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Err(e) = self.activity_stats.save() {
+            eprintln!("vag: failed to save activity stats on exit ({e:#})");
+        }
         self.state.save().context("saving state on exit")
     }
 
@@ -619,6 +781,11 @@ impl App {
             } => self.on_archive_done(key, archived, result),
             AppEvent::DeleteDone { key, result } => self.on_delete_done(key, result),
             AppEvent::DirScan { id, dirs, done } => self.on_dir_scan(id, dirs, done),
+            AppEvent::DiffDone {
+                key,
+                generation,
+                result,
+            } => self.on_diff_done(key, generation, result),
             AppEvent::Resize => self.on_resize(term)?,
             AppEvent::Tick => self.on_tick(term)?,
         }
@@ -626,18 +793,184 @@ impl App {
     }
 
     fn on_stdin(&mut self, bytes: Vec<u8>, term: &mut Terminal<Backend>) -> Result<()> {
-        if self.zoomed || (self.focus == Focus::Pane && self.modal.is_none()) {
+        // Peel mouse reports off the raw stream first — they must reach
+        // neither a child (as garbage input) nor the chrome parser. Zoomed,
+        // the child owns the real terminal (vag's capture is off; any mouse
+        // bytes belong to modes the child itself enabled) — forward verbatim.
+        let bytes = if self.cfg.ui.mouse && !self.zoomed {
+            let (events, rest) = self.mouse_gate.feed(&bytes);
+            for ev in events {
+                self.on_mouse(ev, term);
+            }
+            rest
+        } else {
+            bytes
+        };
+        if self.pane_raw_mode() {
             self.forward_with_detach(&bytes, term)?;
             return Ok(());
         }
-        let keys = self.parser.feed(&bytes);
-        for k in keys {
-            self.on_key(k, term)?;
-            if self.quit {
-                break;
+        // Chrome keys can flip routing mid-chunk (ctrl-g back to the agent
+        // tab, `l`/tab focusing the pane): feed the parser byte-at-a-time
+        // and hand the remainder to the raw path the moment the gate opens
+        // — the mirror image of forward_with_detach's raw→chrome hand-off.
+        // Otherwise `ctrl-g j j enter` batched into one read() would drive
+        // the tree instead of the agent the user just switched back to.
+        for i in 0..bytes.len() {
+            for k in self.parser.feed(&bytes[i..=i]) {
+                self.on_key(k, term)?;
+                if self.quit {
+                    return Ok(());
+                }
+            }
+            if self.pane_raw_mode() {
+                let rest = bytes[i + 1..].to_vec();
+                if !rest.is_empty() {
+                    self.forward_with_detach(&rest, term)?;
+                }
+                return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Raw stdin goes verbatim to the child only while the ACTIVE session
+    /// is showing its PTY tab. With the diff tab up there is no terminal to
+    /// feed — bytes fall through to the chrome parser (one predicate, used
+    /// by both on_stdin and on_tick's held-ESC flush, so they can't drift).
+    fn pane_raw_mode(&self) -> bool {
+        self.zoomed
+            || (self.focus == Focus::Pane
+                && self.modal.is_none()
+                && !self.diff_shown_for_active())
+    }
+
+    fn diff_shown_for_active(&self) -> bool {
+        self.active
+            .as_ref()
+            .and_then(|k| self.diff_views.get(k))
+            .is_some_and(|d| d.shown)
+    }
+
+    /// Route an extracted mouse event by what's under the pointer: tree
+    /// regions get wheel-as-cursor-motion, the pane area gets scrollback /
+    /// forwarding via `pane_mouse`. Modals ignore the mouse entirely.
+    fn on_mouse(&mut self, ev: MouseEvent, term: &mut Terminal<Backend>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let area = term
+            .size()
+            .map(|s| Rect::new(0, 0, s.width, s.height))
+            .unwrap_or(Rect::new(0, 0, 120, 40));
+        // SGR coordinates are 1-based; Rect::contains wants 0-based cells.
+        let pos = ratatui::layout::Position {
+            x: ev.col.saturating_sub(1),
+            y: ev.row.saturating_sub(1),
+        };
+        let Some(active) = self.active.clone() else {
+            // Full dashboard: the whole screen is the tree.
+            self.tree_wheel(ev);
+            return;
+        };
+        // An unfinished forwarded drag stays with the pane wherever the
+        // pointer goes, so the child sees its release.
+        if self.mouse_down_in_pane && (ev.is_motion() || !ev.press) {
+            self.pane_mouse(&active, ev, area);
+            return;
+        }
+        let (side, main) = self.split_areas(area);
+        let float_hit = self.tree_float && float_rect(area).contains(pos);
+        if float_hit || side.is_some_and(|s| s.contains(pos)) {
+            self.tree_wheel(ev);
+        } else if main.contains(pos) {
+            // Diff tab: the wheel scrolls the diff body (there is no PTY
+            // grid to forward into); clicks just move focus.
+            if let Some(dv) = self
+                .diff_views
+                .get_mut(&active)
+                .filter(|d| d.shown)
+            {
+                if let Some(d) = ev.wheel() {
+                    dv.scroll_by(-(d as i64) * 3);
+                } else if ev.is_left_press() {
+                    self.focus_pane();
+                }
+                self.dirty = true;
+                return;
+            }
+            self.pane_mouse(&active, ev, area);
+        }
+    }
+
+    /// Wheel over a tree region moves the cursor like j/k (the list keeps
+    /// the cursor visible, so this scrolls long lists too). Edit mode owns
+    /// its own cursor — leave it alone.
+    fn tree_wheel(&mut self, ev: MouseEvent) {
+        if self.editbuf.is_some() {
+            return;
+        }
+        if let Some(d) = ev.wheel() {
+            self.move_cursor(-d as i64);
+            self.dirty = true;
+        }
+    }
+
+    /// Mouse over the active pane. Children that enabled SGR mouse mode
+    /// get the event forwarded with pane-local coordinates; for everyone
+    /// else the wheel scrolls the emulator's scrollback (primary screen)
+    /// or turns into arrow keys (alt screen — the iTerm/kitty convention,
+    /// so `less`, pickers and codex's transcript overlay scroll naturally).
+    fn pane_mouse(&mut self, active: &SessionKey, ev: MouseEvent, area: Rect) {
+        // Any release ends a tracked drag, forwarded or not (the child may
+        // have dropped its mouse mode mid-drag).
+        if !ev.press {
+            self.mouse_down_in_pane = false;
+        }
+        let Some(rt) = self.runtimes.get(active) else {
+            return;
+        };
+        let (_, main) = self.split_areas(area);
+        let pane = self.pane_inner(main);
+        let mode = *rt.term().lock().mode();
+        if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
+            // Event classes the child didn't opt into stay home (plain
+            // motion needs 1002/1003; clicks/wheel ride on any mode).
+            if ev.is_motion() && !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+                return;
+            }
+            // Translate to 1-based pane-local coordinates, clamped into the
+            // pane so drags that wander off its edge stay coherent.
+            let col = ev.col.clamp(pane.x + 1, pane.x + pane.width.max(1)) - pane.x;
+            let row = ev.row.clamp(pane.y + 1, pane.y + pane.height.max(1)) - pane.y;
+            if ev.is_left_press() {
+                self.mouse_down_in_pane = true;
+                self.focus_pane();
+                self.dirty = true;
+                self.activity
+                    .entry(active.clone())
+                    .or_default()
+                    .on_user_interaction(now_unix_nanos());
+            }
+            self.write_to(active, &ev.encode_sgr(col, row));
+            return;
+        }
+        if let Some(d) = ev.wheel() {
+            if mode.contains(TermMode::ALT_SCREEN) {
+                let seq: &[u8] = match (d > 0, mode.contains(TermMode::APP_CURSOR)) {
+                    (true, false) => b"\x1b[A\x1b[A\x1b[A",
+                    (true, true) => b"\x1bOA\x1bOA\x1bOA",
+                    (false, false) => b"\x1b[B\x1b[B\x1b[B",
+                    (false, true) => b"\x1bOB\x1bOB\x1bOB",
+                };
+                self.write_to(active, seq);
+            } else {
+                rt.scroll_display(d * 3);
+            }
+        } else if ev.is_left_press() {
+            self.focus_pane();
+            self.dirty = true;
+        }
     }
 
     /// Forward raw bytes to the active runtime, intercepting the detach key.
@@ -653,6 +986,11 @@ impl App {
             self.focus_tree();
             return Ok(());
         };
+        if !bytes.is_empty() && !self.resolve_pending_pane_escape_if_due() {
+            // A quick following byte makes the already-forwarded ESC an
+            // Alt/CSI/SS3 sequence rather than a standalone cancellation.
+            self.pane_attention_escape = None;
+        }
         let db = self.cfg.keys.detach.byte();
         // ctrl-e (toggle sidebar) and ctrl-h (focus tree) are reserved only
         // in NORMAL split-pane focus: zoom hands the whole terminal to the
@@ -663,14 +1001,51 @@ impl App {
         let sidebar_byte = (!self.zoomed && self.cfg.ui.tree == TreeMode::Sidebar)
             .then_some(self.cfg.keys.toggle_sidebar.byte());
         let focus_tree_byte = (!self.zoomed).then_some(self.cfg.keys.focus_tree.byte());
-        for (i, &b) in bytes.iter().enumerate() {
+        let diff_byte = (!self.zoomed).then_some(self.cfg.keys.toggle_diff.byte());
+        // PgUp/PgDn scroll the pane's scrollback while the child is on the
+        // PRIMARY screen (claude and codex both are — codex's history-insert
+        // scroll regions do land in the emulator's scrollback). Alt-screen
+        // children (pickers, codex's ctrl+t transcript overlay, vim in a
+        // shell) get the keys verbatim: they own paging themselves — and
+        // their grid has no scrollback to show anyway. Zoomed, the child
+        // owns the real terminal, so nothing is intercepted.
+        let page_scroll = !self.zoomed
+            && bytes.contains(&ESC_BYTE)
+            && self
+                .runtimes
+                .get(&active)
+                .is_some_and(|rt| !rt.term().lock().mode().contains(TermMode::ALT_SCREEN));
+        let mut i = 0;
+        let mut attention_action = PaneAttentionAction::None;
+        let mut trailing_escape = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            // Checked BEFORE the gate consumes the byte; the skipped bytes
+            // are never forwarded, so gate state stays in lockstep with
+            // what the child actually receives.
+            if page_scroll
+                && !self.pane_paste.in_paste
+                && (bytes[i..].starts_with(PAGE_UP) || bytes[i..].starts_with(PAGE_DOWN))
+            {
+                if i > 0 {
+                    self.write_to_with_attention(&active, &bytes[..i], attention_action);
+                }
+                self.scroll_active(if bytes[i + 2] == b'5' { 20 } else { -20 });
+                let rest = bytes[i + PAGE_UP.len()..].to_vec();
+                if !rest.is_empty() {
+                    self.forward_with_detach(&rest, term)?;
+                }
+                return Ok(());
+            }
             let in_paste = self.pane_paste.feed(b);
             if in_paste {
+                trailing_escape = false;
+                i += 1;
                 continue;
             }
             if b == db {
                 if i > 0 {
-                    self.write_to(&active, &bytes[..i]);
+                    self.write_to_with_attention(&active, &bytes[..i], attention_action);
                 }
                 self.last_detach = Some(Instant::now());
                 self.detach(term)?;
@@ -684,7 +1059,7 @@ impl App {
             }
             if Some(b) == sidebar_byte {
                 if i > 0 {
-                    self.write_to(&active, &bytes[..i]);
+                    self.write_to_with_attention(&active, &bytes[..i], attention_action);
                 }
                 self.sidebar_hidden = !self.sidebar_hidden;
                 // The raw-byte path never marks dirty on its own (on_key
@@ -699,7 +1074,7 @@ impl App {
             }
             if Some(b) == focus_tree_byte {
                 if i > 0 {
-                    self.write_to(&active, &bytes[..i]);
+                    self.write_to_with_attention(&active, &bytes[..i], attention_action);
                 }
                 self.focus_tree();
                 self.dirty = true; // same as detach(): repaint the focus move
@@ -709,17 +1084,118 @@ impl App {
                 }
                 return Ok(());
             }
+            if Some(b) == diff_byte {
+                if i > 0 {
+                    self.write_to_with_attention(&active, &bytes[..i], attention_action);
+                }
+                self.toggle_diff(&active);
+                self.dirty = true;
+                // The gate flips with the tab: remaining bytes are chrome
+                // input for the diff view now, not child input.
+                let rest = bytes[i + 1..].to_vec();
+                if !rest.is_empty() {
+                    self.on_stdin(rest, term)?;
+                }
+                return Ok(());
+            }
+            // Raw pane input still has enough framing here to distinguish
+            // submit/cancel controls from bracketed paste content. ESC uses
+            // the ambiguity timer below because stdin can split an arrow
+            // sequence after its first byte.
+            match b {
+                b'\r' | b'\n' => attention_action = PaneAttentionAction::Submit,
+                0x03 | 0x04 => attention_action = PaneAttentionAction::Cancel,
+                _ => {}
+            }
+            trailing_escape = b == ESC_BYTE;
+            i += 1;
         }
+        let escape_boundary = trailing_escape.then(|| (Instant::now(), now_unix_nanos()));
         if !bytes.is_empty() {
-            self.write_to(&active, bytes);
+            self.write_to_with_attention(&active, bytes, attention_action);
+        }
+        if let Some((since, observed_at_unix_nanos)) = escape_boundary
+            && self
+                .activity
+                .get(&active)
+                .and_then(Activity::attention)
+                .is_some()
+        {
+            self.pane_attention_escape = Some((active, since, observed_at_unix_nanos));
         }
         Ok(())
     }
 
+    /// Resolve a forwarded trailing ESC only after the same ambiguity window
+    /// used by the chrome parser. Returns true once a pending candidate was
+    /// consumed; false means it is still young (or absent).
+    fn resolve_pending_pane_escape_if_due(&mut self) -> bool {
+        let Some((key, since, observed_at_unix_nanos)) = self.pane_attention_escape.clone() else {
+            return false;
+        };
+        if since.elapsed() < PANE_ESC_QUIET {
+            return false;
+        }
+        let key = self.runtime_aliases.get(&key).cloned().unwrap_or(key);
+        self.pane_attention_escape = None;
+        if self
+            .runtimes
+            .get(&key)
+            .is_some_and(SessionRuntime::is_running)
+            && let Some(activity) = self.activity.get_mut(&key)
+        {
+            activity.on_user_cancel(observed_at_unix_nanos);
+            self.dirty = true;
+        }
+        true
+    }
+
+    fn write_to_with_attention(
+        &mut self,
+        key: &SessionKey,
+        bytes: &[u8],
+        action: PaneAttentionAction,
+    ) {
+        let observed_at_unix_nanos = now_unix_nanos();
+        let activity = self.activity.entry(key.clone()).or_default();
+        match action {
+            PaneAttentionAction::None => {}
+            PaneAttentionAction::Submit => {
+                activity.on_user_submit(observed_at_unix_nanos, Instant::now());
+            }
+            PaneAttentionAction::Cancel => {
+                activity.on_user_cancel(observed_at_unix_nanos);
+            }
+        }
+        self.write_to(key, bytes);
+    }
+
     fn write_to(&mut self, key: &SessionKey, bytes: &[u8]) {
+        // Capture this boundary before the child receives the bytes: a fast
+        // Codex can create its row synchronously from the first prompt.
+        let input_after = SystemTime::now();
+        let should_discover = !bytes.is_empty()
+            && self.pending.get_mut(key).is_some_and(|ctx| {
+                ctx.input_sent = true;
+                if key.agent == AgentKind::Codex
+                    && ctx
+                        .codex_search_after
+                        .checked_add(actions::CODEX_ID_START_WINDOW)
+                        .is_some_and(|end| input_after > end)
+                {
+                    ctx.codex_search_after = input_after;
+                }
+                !ctx.discovering
+            });
         if let Some(rt) = self.runtimes.get(key) {
             rt.write_input_filtered(bytes);
             self.last_input_at.insert(key.clone(), Instant::now());
+        }
+        // Some Codex versions do not materialize a durable thread until the
+        // first prompt. If the startup lookup timed out, input is the useful
+        // event that should restart it (one worker at a time).
+        if should_discover {
+            self.spawn_discovery(key);
         }
     }
 
@@ -728,11 +1204,20 @@ impl App {
     fn set_active(&mut self, key: Option<SessionKey>) {
         if self.active != key {
             self.pane_paste.reset();
+            self.mouse_down_in_pane = false;
         }
         if key.is_none() {
             // No session behind the overlay: the full dashboard takes the
             // screen and any float state is stale.
             self.tree_float = false;
+        }
+        if let Some(key) = key.as_ref()
+            && let Some(activity) = self.activity.get_mut(key)
+            && activity.mark_viewed()
+        {
+            // Entering the session acknowledges its completion immediately;
+            // do not wait for the next observation tick to clear the badge.
+            self.dirty = true;
         }
         self.active = key;
     }
@@ -741,8 +1226,21 @@ impl App {
     /// is no persistent sidebar, so tree focus means the float is open —
     /// the two must move together or input would go to an invisible tree.
     fn focus_tree(&mut self) {
+        let returning_from_pane = self.focus == Focus::Pane;
         self.focus = Focus::Tree;
         self.tree_float = self.cfg.ui.tree == TreeMode::Float && self.active.is_some();
+        // Pane focus can outlive tree-cursor movement (for example after a
+        // 1–9 jump). Returning to the tree should land on the session the
+        // pane is actually showing, not on a stale row. If filtering or a
+        // collapsed group makes that row invisible, preserve the cursor and
+        // the user's current tree view instead of changing it implicitly.
+        if returning_from_pane
+            && self.editbuf.is_none()
+            && let Some(active) = self.active.as_ref()
+            && let Some(i) = locate_row(&self.rows, &RowAnchor::Session(active.clone()))
+        {
+            self.cursor = i;
+        }
     }
 
     /// Route input to the pane; dismisses the float if it was open.
@@ -797,6 +1295,7 @@ impl App {
             }
             RuntimeEvent::Exited(status) => {
                 self.exited.insert(key.clone());
+                self.remove_agent_settings(&key);
                 if self.zoomed && self.active.as_ref() == Some(&key) {
                     // Child gone while it owned the screen: reclaim it.
                     // (handled on next tick/draw via exit_zoom)
@@ -810,7 +1309,73 @@ impl App {
                 self.request_scan();
                 self.dirty = true;
             }
-            RuntimeEvent::Title | RuntimeEvent::Bell => {
+            RuntimeEvent::Agent(event) => {
+                // A hook packet can outlive a just-closed runtime. Never let
+                // it recreate ghost activity under an old/provisional key.
+                if !self
+                    .runtimes
+                    .get(&key)
+                    .is_some_and(SessionRuntime::is_running)
+                {
+                    return Ok(());
+                }
+                let viewed = self.active.as_ref() == Some(&key);
+                let now = Instant::now();
+                // Close the active-output interval at the native boundary
+                // instead of losing up to one 100ms dashboard tick.
+                self.observe_runtime_activity(&key, now);
+                // Turn boundaries are when the worktree just changed shape:
+                // refresh a showing diff right away instead of waiting for
+                // the slow fallback cadence.
+                let turn_done = matches!(event.kind, AgentEventKind::TurnCompleted);
+                self.activity
+                    .entry(key.clone())
+                    .or_default()
+                    .on_agent_event(event, now, viewed);
+                if turn_done {
+                    self.request_diff(&key);
+                }
+                self.dirty = true;
+            }
+            RuntimeEvent::NativeNotification {
+                observed_at_unix_nanos,
+                message,
+            } => {
+                // Codex's native OSC 9 payload distinguishes its fixed
+                // approval/plan messages from the normal turn-complete
+                // preview. Unknown providers are ignored; Claude uses its
+                // authenticated hook path instead.
+                if key.agent == AgentKind::Codex
+                    && self
+                        .runtimes
+                        .get(&key)
+                        .is_some_and(SessionRuntime::is_running)
+                    && let Some(kind) = normalize_codex_notification(&message)
+                {
+                    let viewed = self.active.as_ref() == Some(&key);
+                    let now = Instant::now();
+                    self.observe_runtime_activity(&key, now);
+                    let turn_done = matches!(kind, AgentEventKind::TurnCompleted);
+                    self.activity.entry(key.clone()).or_default().on_agent_event(
+                        AgentEvent {
+                            observed_at_unix_nanos,
+                            kind,
+                        },
+                        now,
+                        viewed,
+                    );
+                    if turn_done {
+                        self.request_diff(&key);
+                    }
+                }
+                self.dirty = true;
+            }
+            // Ordinary BEL has no provider provenance and must never create
+            // a sticky semantic wait (a nested tool can print one).
+            RuntimeEvent::Bell => {
+                self.dirty = true;
+            }
+            RuntimeEvent::Title => {
                 self.dirty = true;
             }
         }
@@ -918,6 +1483,15 @@ impl App {
         let mut out = Vec::new();
 
         for (provisional, ctx) in pending {
+            // Codex's normal dashboard scan intentionally erases thread
+            // provenance. Matching one of those rows by cwd + timestamp can
+            // therefore steal an unrelated CLI/app thread started in the
+            // same repo. The dedicated Codex resolver retains SQLite /
+            // rollout provenance and retries while the child is alive, so
+            // only the Claude registry fallback belongs on this path.
+            if provisional.agent == AgentKind::Codex {
+                continue;
+            }
             if ctx.cwd.as_os_str().is_empty()
                 || !self
                     .runtimes
@@ -957,6 +1531,7 @@ impl App {
         let Some(mut ctx) = self.pending.remove(&provisional) else {
             return;
         };
+        ctx.discovering = false;
         let follow_cursor =
             self.rows.get(self.cursor).and_then(Row::session_key) == Some(&provisional);
         let mut rekeyed = None;
@@ -996,8 +1571,28 @@ impl App {
                     if let Some(a) = self.activity.remove(&provisional) {
                         self.activity.insert(real.clone(), a);
                     }
+                    if let Some(path) = self.agent_settings.remove(&provisional) {
+                        self.agent_settings.insert(real.clone(), path);
+                    }
+                    if let Some((key, _, _)) = self.pane_attention_escape.as_mut()
+                        && *key == provisional
+                    {
+                        *key = real.clone();
+                    }
                     if let Some(t) = self.last_input_at.remove(&provisional) {
                         self.last_input_at.insert(real.clone(), t);
+                    }
+                    if let Some(v) = self.diff_views.remove(&provisional) {
+                        self.diff_views.insert(real.clone(), v);
+                    }
+                    if let Some(v) = self.diff_repo.remove(&provisional) {
+                        self.diff_repo.insert(real.clone(), v);
+                    }
+                    if let Some(v) = self.diff_scanners.remove(&provisional) {
+                        self.diff_scanners.insert(real.clone(), v);
+                    }
+                    if self.diff_in_flight.remove(&provisional) {
+                        self.diff_in_flight.insert(real.clone());
                     }
                     for k in self.open_order.iter_mut() {
                         if *k == provisional {
@@ -1021,10 +1616,31 @@ impl App {
                     {
                         let _ = self.state.set_session_folder(&real, Some(folder));
                     }
+                    // The base sha was captured at spawn under the
+                    // provisional key; now that a durable id exists it can
+                    // be persisted (first-open wins across restarts). The
+                    // ctx tombstone covers panes closed before resolution —
+                    // close_runtime already dropped their diff_repo entry.
+                    let spawn_base = self
+                        .diff_repo
+                        .get(&real)
+                        .and_then(|rc| rc.base.clone())
+                        .or_else(|| ctx.base.clone());
+                    let spawn_anchor = self
+                        .diff_repo
+                        .get(&real)
+                        .map(|rc| rc.spawned_at)
+                        .unwrap_or_else(|| ctx.spawned_after.into());
                     let session = self.state.session_mut(&real);
                     session.last_opened = Some(Utc::now());
                     if let Some(name) = ctx.name_override.as_ref() {
                         session.name_override = Some(name.clone());
+                    }
+                    if session.base_commit.is_none()
+                        && let Some(b) = spawn_base
+                    {
+                        session.base_commit = Some(b);
+                        session.base_recorded_at = Some(spawn_anchor);
                     }
                     let resolved_title = dashboard::state_name(&self.state, &real)
                         .or_else(|| {
@@ -1047,20 +1663,27 @@ impl App {
                 }
             }
             None => {
-                // Codex can defer durable rollout creation until a slow first
-                // turn completes. Keep retrying in bounded worker windows for
-                // as long as the child lives; a single timeout must never make
-                // the synthetic key permanent.
+                // Some Codex versions defer durable identity until the first
+                // prompt. Claude can keep retrying its cheap pid registry;
+                // Codex waits for pane input instead of hot-scanning rollout
+                // directories forever while an untouched TUI sits open.
                 let runtime = self.runtimes.get(&provisional);
                 let running = runtime.is_some_and(SessionRuntime::is_running);
                 let can_retry = running
                     && (provisional.agent == AgentKind::Codex
                         || runtime.and_then(SessionRuntime::child_pid).is_some());
-                if can_retry {
+                if retry_identity_after_timeout(provisional.agent, can_retry, ctx.input_sent) {
                     self.pending.insert(provisional.clone(), ctx);
                     self.spawn_discovery(&provisional);
+                    if provisional.agent == AgentKind::Claude {
+                        self.set_status(
+                            "still identifying the new session (pane remains usable)".into(),
+                        );
+                    }
+                } else if can_retry {
+                    self.pending.insert(provisional.clone(), ctx);
                     self.set_status(
-                        "still identifying the new session (pane remains usable)".into(),
+                        "session ready — its identity will be saved after the first prompt".into(),
                     );
                 } else if !running {
                     self.set_status(
@@ -1116,14 +1739,50 @@ impl App {
         Ok(())
     }
 
+    /// Sample one runtime's PTY accounting at an explicit boundary. Native
+    /// events call this immediately before their state transition; the tick
+    /// loop uses the same path for normal 100ms accumulation.
+    fn observe_runtime_activity(&mut self, key: &SessionKey, now: Instant) {
+        let Some(rt) = self.runtimes.get(key) else {
+            return;
+        };
+        if !rt.is_running() {
+            return;
+        }
+        let viewed = self.active.as_ref() == Some(key);
+        let credited = self.activity.entry(key.clone()).or_default().observe(
+            now,
+            rt.last_output().elapsed(),
+            self.last_input_at.get(key).map(Instant::elapsed),
+            viewed,
+        );
+        if !credited.is_zero() {
+            self.activity_stats
+                .credit(Local::now().date_naive(), key.agent, credited);
+            self.stats_dirty = true;
+        }
+    }
+
     fn on_tick(&mut self, term: &mut Terminal<Backend>) -> Result<()> {
+        self.resolve_pending_pane_escape_if_due();
         if let Some(k) = self.parser.flush_pending_esc() {
-            if !(self.zoomed || (self.focus == Focus::Pane && self.modal.is_none())) {
+            if !self.pane_raw_mode() {
                 self.on_key(k, term)?;
             } else if let Some(active) = self.active.clone() {
                 // a held ESC belongs to the child in pane mode
                 self.write_to(&active, &[0x1b]);
             }
+        }
+        // Hooks write datagrams independently of the PTY. Drain them on the
+        // existing 100ms cadence, then route through the same alias-aware
+        // runtime handler as reader-thread events.
+        let native_events = self
+            .agent_events
+            .as_ref()
+            .map(AgentEventListener::drain)
+            .unwrap_or_default();
+        for routed in native_events {
+            self.on_runtime(routed.key, RuntimeEvent::Agent(routed.event), term)?;
         }
         if let Some((_, t)) = &self.status
             && t.elapsed() > STATUS_TTL
@@ -1144,6 +1803,10 @@ impl App {
                 self.set_status("agent exited — returned to vag".into());
             }
         }
+        if self.last_diff_poll.elapsed() >= DIFF_POLL_EVERY {
+            self.last_diff_poll = Instant::now();
+            self.poll_diff_sources();
+        }
         if self.last_external.elapsed() > RESCAN_EVERY {
             self.refresh_external();
             self.dirty = true;
@@ -1159,21 +1822,20 @@ impl App {
         // while a runtime is open.
         if !self.runtimes.is_empty() {
             let now = Instant::now();
-            for (k, rt) in &self.runtimes {
-                if !rt.is_running() {
-                    continue;
-                }
-                let viewed = self.active.as_ref() == Some(k);
-                self.activity.entry(k.clone()).or_default().observe(
-                    now,
-                    rt.last_output().elapsed(),
-                    self.last_input_at.get(k).map(Instant::elapsed),
-                    viewed,
-                );
+            let keys: Vec<_> = self.runtimes.keys().cloned().collect();
+            for key in keys {
+                self.observe_runtime_activity(&key, now);
             }
             if !self.zoomed {
                 self.dirty = true;
             }
+        }
+        if self.stats_dirty && self.stats_last_flush.elapsed() >= STATS_FLUSH_EVERY {
+            self.stats_last_flush = Instant::now();
+            if let Err(e) = self.activity_stats.save() {
+                eprintln!("vag: failed to save activity stats ({e:#})");
+            }
+            self.stats_dirty = false;
         }
         // Relative-time labels tick at 1Hz even when nothing else changes —
         // repaints are diffed by ratatui, so this only touches changed cells.
@@ -1249,6 +1911,351 @@ impl App {
         });
     }
 
+    // ---------- diff view ----------
+
+    /// Flip a session between its agent PTY tab and its diff tab — the tab
+    /// switch always lands focus in the pane area (switching tabs means
+    /// engaging with the session, whichever side you invoked it from).
+    fn toggle_diff(&mut self, key: &SessionKey) {
+        let scope_all = key.agent == AgentKind::Shell; // no transcript to scope by
+        let dv = self
+            .diff_views
+            .entry(key.clone())
+            .or_insert_with(|| DiffView::new(scope_all));
+        dv.shown = !dv.shown;
+        let now_shown = dv.shown;
+        if now_shown {
+            // Fresh look at the diff always starts in the file tree — the
+            // orientation panel — not wherever focus was left last time.
+            dv.focus = DiffFocus::Tree;
+        }
+        self.dirty = true;
+        self.focus_pane();
+        if now_shown {
+            self.request_diff(key);
+        }
+    }
+
+    /// Keys while the active session's diff tab has pane focus. Chrome
+    /// chords keep their meaning (detach/focus-tree leave for the sidebar
+    /// with the diff still showing, like an unfocused agent pane would).
+    fn on_diff_key(&mut self, key: Key) -> Result<()> {
+        let Some(active) = self.active.clone() else {
+            return Ok(());
+        };
+        let ctrl_of = |k: DetachKey| (b'a' + k.byte() - 1) as char;
+        let detach_ctrl = ctrl_of(self.cfg.keys.detach);
+        let focus_tree_ctrl = ctrl_of(self.cfg.keys.focus_tree);
+        let diff_ctrl = ctrl_of(self.cfg.keys.toggle_diff);
+        let sidebar_ctrl = ctrl_of(self.cfg.keys.toggle_sidebar);
+        match key {
+            Key::Ctrl(c) if c == detach_ctrl || c == focus_tree_ctrl => {
+                self.focus_tree();
+                return Ok(());
+            }
+            Key::Ctrl(c) if c == diff_ctrl => {
+                self.toggle_diff(&active);
+                return Ok(());
+            }
+            // Same sidebar toggle the agent tab has (and the same gate:
+            // only Sidebar mode has a sidebar to hide).
+            Key::Ctrl(c) if c == sidebar_ctrl && self.cfg.ui.tree == TreeMode::Sidebar => {
+                self.sidebar_hidden = !self.sidebar_hidden;
+                return Ok(());
+            }
+            Key::Esc => {
+                if let Some(dv) = self.diff_views.get_mut(&active) {
+                    dv.shown = false;
+                }
+                return Ok(());
+            }
+            Key::Char(c) if self.cfg.keys.action_for(c) == Some(KeyAction::DiffView) => {
+                self.toggle_diff(&active);
+                return Ok(());
+            }
+            _ => {}
+        }
+        // View-local keys. Actions that need &mut self after the borrow
+        // are deferred out of the match.
+        enum After {
+            None,
+            Refresh,
+            Rescope,
+            Rebase,
+        }
+        let mut after = After::None;
+        if let Some(dv) = self.diff_views.get_mut(&active).filter(|d| d.shown) {
+            match key {
+                Key::Tab | Key::BackTab | Key::Left | Key::Right | Key::Char('h' | 'l') => {
+                    dv.toggle_focus()
+                }
+                Key::Down | Key::Char('j') => match dv.focus {
+                    DiffFocus::Tree => dv.move_cursor(1),
+                    DiffFocus::Body => dv.scroll_by(1),
+                },
+                Key::Up | Key::Char('k') => match dv.focus {
+                    DiffFocus::Tree => dv.move_cursor(-1),
+                    DiffFocus::Body => dv.scroll_by(-1),
+                },
+                Key::PageDown | Key::Ctrl('f') => dv.page(1),
+                Key::PageUp | Key::Ctrl('b') => dv.page(-1),
+                // vim half-page motions. These sit after the chord guards
+                // above, so a user who rebinds a chrome chord onto ctrl-d/u
+                // keeps the chrome meaning.
+                Key::Ctrl('d') => dv.half_page(1),
+                Key::Ctrl('u') => dv.half_page(-1),
+                Key::Char('g') | Key::Home => dv.jump_top(),
+                Key::Char('G') | Key::End => dv.jump_bottom(),
+                Key::Enter => dv.activate_selected(),
+                Key::Char(' ') => dv.toggle_collapse(),
+                Key::Char('a') => {
+                    dv.scope_all = !dv.scope_all;
+                    after = After::Rescope;
+                }
+                Key::Char('r') => after = After::Refresh,
+                Key::Char('B') => after = After::Rebase,
+                _ => {}
+            }
+        }
+        match after {
+            After::None => {}
+            After::Refresh | After::Rescope => self.request_diff(&active),
+            After::Rebase => self.rebase_diff(&active),
+        }
+        Ok(())
+    }
+
+    /// Kick a background `git diff` for one session's view. One worker per
+    /// session at a time; triggers arriving mid-compute set `want_again`
+    /// so the view converges without stacking threads.
+    fn request_diff(&mut self, key: &SessionKey) {
+        let touched: Option<Vec<PathBuf>> = self
+            .diff_scanners
+            .get(key)
+            .map(|s| s.touched().files.iter().cloned().collect());
+        let Some(dv) = self.diff_views.get_mut(key) else {
+            return;
+        };
+        if !dv.shown {
+            return;
+        }
+        if self.diff_in_flight.contains(key) {
+            dv.want_again = true;
+            return;
+        }
+        let Some(rc) = self.diff_repo.get(key) else {
+            dv.error = Some("diff unavailable for this session (remote?)".into());
+            return;
+        };
+        let Some(root) = rc.root.clone() else {
+            dv.error = Some("not a git repository".into());
+            dv.snapshot = None;
+            return;
+        };
+        dv.touched_empty = touched.as_ref().is_none_or(Vec::is_empty);
+        let paths = if dv.scope_all {
+            None
+        } else {
+            Some(touched.unwrap_or_default())
+        };
+        dv.generation += 1;
+        dv.pending = true;
+        dv.want_again = false;
+        dv.needs_width_refresh = false;
+        dv.req_at = Instant::now();
+        let generation = dv.generation;
+        // Delta wraps to a fixed width: hand the worker the body panel's
+        // current width (falls back sanely before the first draw).
+        let delta_width = self
+            .last_pane_rect
+            .map(|r| dv.body_width(r))
+            .filter(|w| *w > 0)
+            .unwrap_or(100);
+        let use_delta = self.cfg.diff.use_delta;
+        let delta_args = self.cfg.diff.delta_args.clone();
+        self.diff_in_flight.insert(key.clone());
+        let base = rc.base.clone();
+        let tx = self.tx.clone();
+        let key = key.clone();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (resolved, note) = gitdiff::resolve_base(&root, base.as_deref());
+                gitdiff::compute_diff(&root, resolved.as_deref(), paths.as_deref(), true)
+                    .map(|mut s| {
+                        s.base_note = note;
+                        let delta = use_delta
+                            .then(|| diffview::render_delta(&s.files, delta_width, &delta_args))
+                            .flatten();
+                        (s, delta)
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            }))
+            .unwrap_or_else(|_| Err("diff computation crashed".into()));
+            let _ = tx.send(AppEvent::DiffDone {
+                key,
+                generation,
+                result,
+            });
+        });
+    }
+
+    fn on_diff_done(
+        &mut self,
+        key: SessionKey,
+        generation: u64,
+        result: Result<(DiffSnapshot, Option<diffview::DeltaOutput>), String>,
+    ) {
+        let key = self.runtime_aliases.get(&key).cloned().unwrap_or(key);
+        let Some(dv) = self.diff_views.get_mut(&key) else {
+            // View gone (pane closed): the guard entry is orphaned.
+            self.diff_in_flight.remove(&key);
+            return;
+        };
+        // Generation mismatch means the watchdog already released this
+        // worker's guard and a NEWER worker owns the current entry — a
+        // stale reply must not free it, or the 1s poll spawns concurrent
+        // git workers whose replies are each dropped as stale in turn.
+        if generation != dv.generation {
+            return;
+        }
+        self.diff_in_flight.remove(&key);
+        dv.pending = false;
+        dv.last_done = Some(Instant::now());
+        match result {
+            Ok((snap, delta)) => {
+                // Identical fingerprint ⇒ byte-identical diff: keep the
+                // current tree/scroll state untouched (no visual jitter on
+                // the 2s fallback refresh) — unless the delta render itself
+                // changed shape (fresh width, delta newly on/off). Base
+                // metadata still syncs: a rebase re-anchor must surface
+                // even on a clean worktree.
+                let unchanged = dv
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|old| old.fingerprint == snap.fingerprint)
+                    && dv.delta_width() == delta.as_ref().map(|d| d.width);
+                if unchanged {
+                    if let Some(old) = dv.snapshot.as_mut() {
+                        old.base = snap.base;
+                        old.base_note = snap.base_note;
+                    }
+                } else {
+                    dv.apply_snapshot(snap, delta);
+                }
+                dv.error = None;
+            }
+            Err(e) => dv.error = Some(e),
+        }
+        if dv.want_again {
+            dv.want_again = false;
+            self.request_diff(&key);
+        }
+        if self.active.as_ref() == Some(&key) && !self.zoomed {
+            self.dirty = true;
+        }
+    }
+
+    /// `B` in the diff view: re-anchor the base to the current HEAD ("show
+    /// changes from now on"), persisted like the spawn-time base.
+    fn rebase_diff(&mut self, key: &SessionKey) {
+        let Some(rc) = self.diff_repo.get_mut(key) else {
+            return;
+        };
+        let Some(root) = rc.root.as_deref() else {
+            return;
+        };
+        let Some(head) = gitdiff::head_sha(root) else {
+            self.set_status("cannot re-anchor: no HEAD (unborn branch?)".into());
+            return;
+        };
+        rc.base = Some(head.clone());
+        // Re-anchoring means "changes from now on": the touched-file scope
+        // restarts alongside the base, so the scanner is rebuilt at the
+        // new boundary (poll_diff_sources recreates it from rc.spawned_at).
+        let now = Utc::now();
+        rc.spawned_at = now;
+        self.diff_scanners.remove(key);
+        // Guard by id shape, not pending-map membership: an exited pane
+        // whose discovery gave up is out of self.pending but still carries
+        // its synthetic "pending-*" key — that must never reach state.json.
+        if key.agent != AgentKind::Shell && !key.id.starts_with("pending-") {
+            let sref = self.state.session_mut(key);
+            sref.base_commit = Some(head);
+            sref.base_recorded_at = Some(now);
+            self.persist();
+        }
+        self.set_status("diff base re-anchored to current HEAD".into());
+        self.request_diff(key);
+    }
+
+    /// 1s cadence off the tick: tail every open runtime's transcript for
+    /// newly touched files, and keep the visible diff fresh even when no
+    /// native event fires (Bash edits leave no transcript record at all).
+    fn poll_diff_sources(&mut self) {
+        // Late scanner creation: a runtime's transcript may only appear
+        // after discovery resolves its id and a scan lands the meta.
+        let keys: Vec<SessionKey> = self.runtimes.keys().cloned().collect();
+        for key in &keys {
+            if key.agent == AgentKind::Shell || self.diff_scanners.contains_key(key) {
+                continue;
+            }
+            let Some(rc) = self.diff_repo.get(key) else {
+                continue;
+            };
+            let Some(meta) = self.meta_idx.get(key).map(|i| &self.sessions[*i]) else {
+                continue;
+            };
+            if meta.source_path.as_os_str().is_empty() {
+                continue; // synthesized (remote) metas have no local transcript
+            }
+            self.diff_scanners.insert(
+                key.clone(),
+                TranscriptScanner::new(key.agent, meta.source_path.clone(), rc.spawned_at),
+            );
+        }
+        for key in &keys {
+            let grew = self
+                .diff_scanners
+                .get_mut(key)
+                .is_some_and(TranscriptScanner::poll);
+            let shown = self.diff_views.get(key).is_some_and(|d| d.shown);
+            if grew && shown {
+                self.request_diff(key);
+            }
+        }
+        // Visible fallback: refresh the rendered diff on a slow cadence —
+        // immediately when a resize invalidated the delta wrap width.
+        if let Some(active) = self.active.clone()
+            && !self.zoomed
+            && let Some(dv) = self.diff_views.get(&active)
+            && dv.shown
+            && !self.diff_in_flight.contains(&active)
+            && (dv.needs_width_refresh
+                || dv
+                    .last_done
+                    .is_none_or(|t| t.elapsed() > DIFF_VISIBLE_REFRESH))
+        {
+            self.request_diff(&active);
+        }
+        // Watchdog: a lost worker must not freeze refreshes forever.
+        let stuck: Vec<SessionKey> = self
+            .diff_in_flight
+            .iter()
+            .filter(|k| {
+                self.diff_views
+                    .get(k)
+                    .is_some_and(|d| d.pending && d.req_at.elapsed() > DIFF_STUCK_AFTER)
+            })
+            .cloned()
+            .collect();
+        for k in stuck {
+            self.diff_in_flight.remove(&k);
+            if let Some(dv) = self.diff_views.get_mut(&k) {
+                dv.pending = false;
+            }
+        }
+    }
+
     // ---------- keys (tree / modal) ----------
 
     fn on_key(&mut self, key: Key, term: &mut Terminal<Backend>) -> Result<()> {
@@ -1257,6 +2264,7 @@ impl App {
         let detach_ctrl = (b'a' + self.cfg.keys.detach.byte() - 1) as char;
         let focus_pane_ctrl = (b'a' + self.cfg.keys.focus_pane.byte() - 1) as char;
         let focus_tree_ctrl = (b'a' + self.cfg.keys.focus_tree.byte() - 1) as char;
+        let toggle_diff_ctrl = (b'a' + self.cfg.keys.toggle_diff.byte() - 1) as char;
         // Any other key invalidates the double-press window, so a stale
         // timestamp can never make a later detach press inject a literal
         // byte instead of detaching.
@@ -1338,6 +2346,13 @@ impl App {
             return Ok(());
         }
 
+        // Diff-tab capture: with the active session showing its diff view
+        // in pane focus, every key belongs to the view (this sits before
+        // the tree match so j/k/tab/digits aren't stolen by navigation).
+        if self.focus == Focus::Pane && self.diff_shown_for_active() {
+            return self.on_diff_key(key);
+        }
+
         match key {
             Key::Ctrl(c) if c == detach_ctrl && self.active.is_some() => {
                 let now = Instant::now();
@@ -1391,6 +2406,12 @@ impl App {
             Key::Ctrl(c) if c == focus_pane_ctrl => self.tmux_select_pane("-R"),
             // ctrl-h while the tree is focused = keep going left.
             Key::Ctrl(c) if c == focus_tree_ctrl => self.tmux_select_pane("-L"),
+            // The tab-switch chord works from every focus context: here it
+            // flips the session's agent ⇄ diff tab and lands in the pane
+            // (same routing as the `D` action, cursor session preferred).
+            Key::Ctrl(c) if c == toggle_diff_ctrl => {
+                self.run_action(KeyAction::DiffView, term)?;
+            }
             Key::Esc => self.on_esc_tree(),
             Key::Char('/') => {
                 self.filter_edit = Some(LineEdit::with_text(self.filter.as_deref().unwrap_or("")));
@@ -1445,6 +2466,24 @@ impl App {
                     if self.active.is_some() {
                         self.enter_zoom(term)?;
                     }
+                }
+            }
+            KeyAction::DiffView => {
+                // Prefer the session under the cursor when it has an open
+                // runtime; otherwise the active one. The diff needs a live
+                // runtime (base sha + transcript tail are spawn-anchored).
+                let target = self
+                    .session_under_cursor()
+                    .filter(|k| self.runtimes.contains_key(k))
+                    .or_else(|| self.active.clone());
+                match target {
+                    Some(k) if self.runtimes.contains_key(&k) => {
+                        if self.active.as_ref() != Some(&k) {
+                            self.set_active(Some(k.clone()));
+                        }
+                        self.toggle_diff(&k);
+                    }
+                    _ => self.set_status("open the session first — diff needs a running pane".into()),
                 }
             }
             KeyAction::Settings => self.open_settings(0),
@@ -1548,11 +2587,20 @@ impl App {
         match self.rows.get(self.cursor) {
             Some(Row::Folder { id, .. }) => Some(id.clone()),
             Some(Row::Empty { folder, .. }) => folder.clone(),
-            Some(Row::Session { key, .. }) => {
-                self.state.session(key).and_then(|r| r.folder.clone())
-            }
+            Some(Row::Session { key, .. }) => self.effective_session_folder(key),
             _ => None,
         }
+    }
+
+    /// Folder intent for rows that may not have a durable store identity
+    /// yet. Pending Codex sessions keep it in memory; resolved/meta-less
+    /// sessions use normal state. Dangling ids degrade to Inbox.
+    fn effective_session_folder(&self, key: &SessionKey) -> Option<String> {
+        self.pending
+            .get(key)
+            .and_then(|ctx| ctx.folder.clone())
+            .or_else(|| self.state.session(key).and_then(|r| r.folder.clone()))
+            .filter(|id| self.state.folder(id).is_some())
     }
 
     fn activate_row(&mut self, term: &mut Terminal<Backend>) -> Result<()> {
@@ -1573,6 +2621,12 @@ impl App {
             Some(Row::Inbox { .. }) => {
                 if !self.collapsed.remove(INBOX_ID) {
                     self.collapsed.insert(INBOX_ID.to_string());
+                }
+                self.rebuild_rows();
+            }
+            Some(Row::Archived { .. }) => {
+                if !self.collapsed.remove(ARCHIVED_ID) {
+                    self.collapsed.insert(ARCHIVED_ID.to_string());
                 }
                 self.rebuild_rows();
             }
@@ -1598,6 +2652,12 @@ impl App {
             Some(Row::Inbox { .. }) => {
                 if !self.collapsed.remove(INBOX_ID) {
                     self.collapsed.insert(INBOX_ID.to_string());
+                }
+                self.rebuild_rows();
+            }
+            Some(Row::Archived { .. }) => {
+                if !self.collapsed.remove(ARCHIVED_ID) {
+                    self.collapsed.insert(ARCHIVED_ID.to_string());
                 }
                 self.rebuild_rows();
             }
@@ -1717,6 +2777,48 @@ impl App {
             self.focus_pane();
             return;
         }
+        let mut instrumented_spec = spec.clone();
+        let mut agent_settings_path = None;
+        let is_remote = self
+            .state
+            .session(&key)
+            .and_then(|session| session.remote.as_ref())
+            .is_some();
+        if !is_remote && is_native_cli(&instrumented_spec.program, key.agent) {
+            match key.agent {
+                AgentKind::Claude => {
+                    if let (Some(listener), Some(helper)) =
+                        (&self.agent_events, &self.agent_event_helper)
+                    {
+                        match instrument_claude(
+                            &mut instrumented_spec.args,
+                            &instrumented_spec.cwd,
+                            helper,
+                            listener.endpoint(),
+                            listener.secret(),
+                            &key,
+                        ) {
+                            Ok(path) => agent_settings_path = Some(path),
+                            Err(e) => {
+                                // Preserve the user's original argv and
+                                // launch with the heuristic fallback if an
+                                // explicit settings layer cannot be safely
+                                // parsed/merged.
+                                instrumented_spec = spec.clone();
+                                eprintln!(
+                                    "vag: Claude native events unavailable for {} ({e:#})",
+                                    key.id
+                                );
+                            }
+                        }
+                    }
+                }
+                AgentKind::Codex => {
+                    add_codex_tui_notifications(&mut instrumented_spec.args);
+                }
+                AgentKind::Shell => {}
+            }
+        }
         let size = self.pane_size();
         let tx = self.tx.clone();
         let events = {
@@ -1734,9 +2836,66 @@ impl App {
         // Capture the boundary before the child can create any registry,
         // SQLite or rollout entry. Sampling after spawn races fast clients.
         let spawned_after = SystemTime::now();
-        match SessionRuntime::spawn(key.clone(), spec, size, events) {
+        match SessionRuntime::spawn(key.clone(), &instrumented_spec, size, events) {
             Ok(rt) => {
                 self.runtimes.insert(key.clone(), rt);
+                if let Some(path) = agent_settings_path {
+                    self.agent_settings.insert(key.clone(), path);
+                }
+                // Diff-view context, captured at the spawn boundary. The
+                // rev-parse pair is a few ms — acceptable on this
+                // user-initiated path. Remote sessions are skipped: their
+                // SpawnSpec.cwd is the LOCAL home dir, and running git
+                // there would attribute vag's own repo to the session.
+                let mut spawn_base: Option<String> = None;
+                if !is_remote {
+                    let now = Utc::now();
+                    let root = gitdiff::repo_root_for(&instrumented_spec.cwd);
+                    let session_ref =
+                        (key.agent != AgentKind::Shell).then(|| self.state.session(&key)).flatten();
+                    let persisted = session_ref.and_then(|s| s.base_commit.clone());
+                    let persisted_at = session_ref.and_then(|s| s.base_recorded_at);
+                    let base = match (&persisted, &root) {
+                        (Some(b), _) => Some(b.clone()),
+                        // Unborn HEAD (fresh `git init`): anchor to git's
+                        // empty tree so staged files and the agent's own
+                        // first commits stay visible in the diff.
+                        (None, Some(r)) => Some(
+                            gitdiff::head_sha(r)
+                                .unwrap_or_else(|| gitdiff::EMPTY_TREE.to_string()),
+                        ),
+                        (None, None) => None,
+                    };
+                    // Persist a newly recorded base for durable ids now;
+                    // provisional ids persist theirs in on_id_resolved.
+                    if persisted.is_none()
+                        && key.agent != AgentKind::Shell
+                        && pending.is_none()
+                        && let Some(b) = &base
+                    {
+                        let sref = self.state.session_mut(&key);
+                        sref.base_commit = Some(b.clone());
+                        sref.base_recorded_at = Some(now);
+                        self.persist();
+                    }
+                    spawn_base = base.clone();
+                    self.diff_repo.insert(
+                        key.clone(),
+                        RepoCtx {
+                            root,
+                            base,
+                            // Re-opened sessions anchor the transcript
+                            // scanner at the FIRST open (matching the
+                            // persisted base), so the agent-files scope
+                            // reconstructs itself across vag restarts.
+                            spawned_at: if persisted.is_some() {
+                                persisted_at.unwrap_or(now)
+                            } else {
+                                now
+                            },
+                        },
+                    );
+                }
                 self.activity.insert(key.clone(), Activity::default());
                 self.last_input_at.remove(&key);
                 self.exited.remove(&key);
@@ -1748,8 +2907,10 @@ impl App {
                 self.pane_paste.reset();
                 self.focus_pane();
                 if let Some(mut ctx) = pending {
-                    ctx.cwd = spec.cwd.clone();
+                    ctx.cwd = instrumented_spec.cwd.clone();
                     ctx.spawned_after = spawned_after;
+                    ctx.codex_search_after = spawned_after;
+                    ctx.base = spawn_base;
                     if let Some(name) = &ctx.name_override {
                         self.provisional_labels.insert(key.clone(), name.clone());
                     }
@@ -1758,20 +2919,36 @@ impl App {
                 }
                 self.rebuild_rows();
             }
-            Err(e) => self.set_status(format!("spawn failed: {e:#}")),
+            Err(e) => {
+                if let Some(path) = agent_settings_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.set_status(format!("spawn failed: {e:#}"));
+            }
         }
     }
 
-    fn spawn_discovery(&self, provisional: &SessionKey) {
-        let Some(ctx) = self.pending.get(provisional) else {
+    fn spawn_discovery(&mut self, provisional: &SessionKey) {
+        let Some(ctx) = self.pending.get_mut(provisional) else {
             return;
         };
+        if ctx.discovering {
+            return;
+        }
+        ctx.discovering = true;
         let child_pid = self
             .runtimes
             .get(provisional)
             .and_then(SessionRuntime::child_pid);
         let cwd = ctx.cwd.clone();
-        let spawned_after = ctx.spawned_after;
+        let spawned_after = if provisional.agent == AgentKind::Codex {
+            // Keep the chosen launch/first-input boundary stable across
+            // retries. Codex may make a row visible minutes later while its
+            // created timestamp still records that original boundary.
+            ctx.codex_search_after
+        } else {
+            ctx.spawned_after
+        };
         let excluded_ids = ctx.excluded_ids.clone();
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
@@ -1864,10 +3041,10 @@ impl App {
             &self.provisional_labels,
         );
         // Land the buffer cursor on the row the tree cursor was on (the
-        // "+ new session" row has no buffer line; j clamps at the end).
+        // rendering-only rows have no buffer line; j clamps at the end).
         let target = self.rows[..self.cursor.min(self.rows.len())]
             .iter()
-            .filter(|r| !matches!(r, Row::NewSession))
+            .filter(|r| !matches!(r, Row::NewSession | Row::Spacer | Row::Empty { .. }))
             .count();
         let mut buf = EditBuf::new(lines);
         for _ in 0..target {
@@ -2012,10 +3189,9 @@ impl App {
                     .state
                     .rename_folder(&id, &name)
                     .map_err(|e| format!("{e:#}")),
-                EditAction::DeleteFolder { id } => {
-                    self.collapsed.remove(&id);
-                    self.state.delete_folder(&id).map_err(|e| format!("{e:#}"))
-                }
+                EditAction::DeleteFolder { id } => self
+                    .delete_folder_and_reparent_pending(&id)
+                    .map_err(|e| format!("{e:#}")),
                 EditAction::RenameSession { key, name } => {
                     let name = name.trim().to_string();
                     self.state.session_mut(&key).name_override =
@@ -2156,7 +3332,7 @@ impl App {
     /// the edit would be lost when the real id resolves.
     fn guard_provisional(&mut self, key: &SessionKey) -> bool {
         if key.id.starts_with("pending-") {
-            self.set_status("session still starting — try again in a moment".into());
+            self.set_status("session identity is not saved yet — try again after a prompt".into());
             return true;
         }
         false
@@ -2177,7 +3353,14 @@ impl App {
         let Some(key) = self.session_under_cursor() else {
             return;
         };
-        if self.refuse_shell(&key) || self.guard_provisional(&key) {
+        if self.refuse_shell(&key) {
+            return;
+        }
+        // A live pending context can safely queue folder intent without ever
+        // writing its synthetic key to state.json. Unknown/stale pending keys
+        // remain guarded like every other state mutation.
+        if key.id.starts_with("pending-") && !self.pending.contains_key(&key) {
+            self.guard_provisional(&key);
             return;
         }
         let mut options: Vec<(Option<String>, String)> = vec![(None, "Inbox".into())];
@@ -2196,12 +3379,78 @@ impl App {
             }
         }
         walk(&self.state, None, 0, &mut options);
-        let current = self.state.session(&key).and_then(|r| r.folder.clone());
+        let current = self.effective_session_folder(&key);
         let idx = options
             .iter()
             .position(|(id, _)| *id == current)
             .unwrap_or(0);
         self.modal = Some(Modal::PickFolder { key, options, idx });
+    }
+
+    /// Apply a folder choice without ever persisting a synthetic pending id.
+    /// The pending context is the write-ahead intent and is transferred to
+    /// the real UUID by `on_id_resolved`.
+    fn commit_session_folder(&mut self, key: SessionKey, folder: Option<String>) {
+        if let Some(id) = folder.as_deref()
+            && self.state.folder(id).is_none()
+        {
+            self.set_status(format!("folder `{id}` no longer exists"));
+            return;
+        }
+        if let Some(ctx) = self.pending.get_mut(&key) {
+            ctx.folder = folder;
+        } else if key.id.starts_with("pending-") {
+            self.set_status("session identity is no longer being tracked".into());
+            return;
+        } else {
+            if let Err(e) = self.state.set_session_folder(&key, folder.as_deref()) {
+                self.set_status(format!("{e:#}"));
+                return;
+            }
+            self.persist();
+        }
+        self.rebuild_rows();
+    }
+
+    /// Rename a pending session in memory, or a resolved session in normal
+    /// durable state. This makes the optional launch name presentation-only,
+    /// not a gate on whether the new pane is usable.
+    fn commit_session_name(&mut self, key: SessionKey, name: String) {
+        let name = name.trim();
+        let name = (!name.is_empty()).then(|| name.to_string());
+        if let Some(ctx) = self.pending.get_mut(&key) {
+            ctx.name_override = name.clone();
+            if let Some(name) = name {
+                self.provisional_labels.insert(key, name);
+            } else {
+                self.provisional_labels.remove(&key);
+            }
+        } else if key.id.starts_with("pending-") {
+            self.set_status("session identity is no longer being tracked".into());
+            return;
+        } else {
+            self.state.session_mut(&key).name_override = name;
+            self.persist();
+        }
+        self.rebuild_rows();
+    }
+
+    /// Deleting a folder reparents durable members in `VagState`; mirror the
+    /// same operation for pending sessions whose folder intent is not stored
+    /// there yet.
+    fn delete_folder_and_reparent_pending(&mut self, id: &str) -> Result<()> {
+        let parent = self
+            .state
+            .folder(id)
+            .and_then(|folder| folder.parent.clone());
+        self.state.delete_folder(id)?;
+        for ctx in self.pending.values_mut() {
+            if ctx.folder.as_deref() == Some(id) {
+                ctx.folder = parent.clone();
+            }
+        }
+        self.collapsed.remove(id);
+        Ok(())
     }
 
     fn start_rename(&mut self) {
@@ -2214,13 +3463,24 @@ impl App {
                 });
             }
             Some(Row::Session { key, meta_idx, .. }) => {
-                if self.refuse_shell(&key) || self.guard_provisional(&key) {
+                if self.refuse_shell(&key) {
+                    return;
+                }
+                // Renames made during Codex's identity hand-off live in the
+                // pending context and are transferred to the real UUID.
+                if key.id.starts_with("pending-") && !self.pending.contains_key(&key) {
+                    self.guard_provisional(&key);
                     return;
                 }
                 let current = self
-                    .state
-                    .session(&key)
-                    .and_then(|r| r.name_override.clone())
+                    .pending
+                    .get(&key)
+                    .and_then(|ctx| ctx.name_override.clone())
+                    .or_else(|| {
+                        self.state
+                            .session(&key)
+                            .and_then(|r| r.name_override.clone())
+                    })
                     .or_else(|| {
                         meta_idx.map(|i| dashboard::display_title(&self.state, &self.sessions[i]))
                     })
@@ -2527,6 +3787,14 @@ impl App {
         if let Some(mut rt) = self.runtimes.remove(key) {
             rt.kill();
         }
+        self.remove_agent_settings(key);
+        if self
+            .pane_attention_escape
+            .as_ref()
+            .is_some_and(|(candidate, _, _)| candidate == key)
+        {
+            self.pane_attention_escape = None;
+        }
         // Attach-only remote codex sessions exist only while their pane is
         // open: closing evaporates the state entry and its synthesized row.
         // (Remote claude entries persist — they're resumable later.)
@@ -2545,6 +3813,10 @@ impl App {
         }
         self.activity.remove(key);
         self.last_input_at.remove(key);
+        self.diff_views.remove(key);
+        self.diff_repo.remove(key);
+        self.diff_scanners.remove(key);
+        self.diff_in_flight.remove(key);
         self.exited.remove(key);
         self.open_order.retain(|k| k != key);
         if let Some(ctx) = self.pending.get_mut(key) {
@@ -2620,6 +3892,11 @@ impl App {
                 id: SettingId::ShowHidden,
                 label: "show hidden at launch".into(),
                 value: on_off(self.cfg.behavior.show_hidden),
+            },
+            SettingRow::Value {
+                id: SettingId::Mouse,
+                label: "mouse (wheel scrolls)".into(),
+                value: on_off(self.cfg.ui.mouse),
             },
             SettingRow::Section("keys".into()),
         ];
@@ -2727,6 +4004,20 @@ impl App {
                 self.rebuild_rows();
                 self.persist_setting("behavior", "show_hidden", self.cfg.behavior.show_hidden);
             }
+            SettingId::Mouse => {
+                self.cfg.ui.mouse = !self.cfg.ui.mouse;
+                // Live: flip the host terminal's reporting right away.
+                let mut out = std::io::stdout();
+                let _ = out.write_all(if self.cfg.ui.mouse {
+                    MOUSE_ON
+                } else {
+                    MOUSE_OFF
+                });
+                let _ = out.flush();
+                self.mouse_gate.reset();
+                self.mouse_down_in_pane = false;
+                self.persist_setting("ui", "mouse", self.cfg.ui.mouse);
+            }
         }
     }
 
@@ -2830,10 +4121,9 @@ impl App {
                 }
             }
             Commit::DeleteFolder { id } => {
-                if let Err(e) = self.state.delete_folder(&id) {
+                if let Err(e) = self.delete_folder_and_reparent_pending(&id) {
                     self.set_status(format!("{e:#}"));
                 } else {
-                    self.collapsed.remove(&id);
                     self.persist();
                     self.rebuild_rows();
                 }
@@ -2859,19 +4149,10 @@ impl App {
                 }
             }
             Commit::RenameSession { key, name } => {
-                let name = name.trim().to_string();
-                self.state.session_mut(&key).name_override =
-                    if name.is_empty() { None } else { Some(name) };
-                self.persist();
-                self.rebuild_rows();
+                self.commit_session_name(key, name);
             }
             Commit::MoveSession { key, folder } => {
-                if let Err(e) = self.state.set_session_folder(&key, folder.as_deref()) {
-                    self.set_status(format!("{e:#}"));
-                } else {
-                    self.persist();
-                    self.rebuild_rows();
-                }
+                self.commit_session_folder(key, folder);
             }
             Commit::NewSessionAgent {
                 agent,
@@ -3427,6 +4708,11 @@ impl App {
         let Some(active) = self.active.clone() else {
             return Ok(());
         };
+        // Zoom is a raw PTY handoff — undefined for the diff tab. Flip
+        // back to the agent tab first so the serialized screen is the PTY.
+        if let Some(dv) = self.diff_views.get_mut(&active) {
+            dv.shown = false;
+        }
         let Some(rt) = self.runtimes.get(&active) else {
             return Ok(());
         };
@@ -3446,6 +4732,12 @@ impl App {
         if !mode.contains(TermMode::BRACKETED_PASTE) {
             execute!(out, ctevent::DisableBracketedPaste)?;
         }
+        // vag's own mouse capture off: zoomed, the child decides — its
+        // replayed modes re-enable reporting if IT asked for the mouse.
+        // Without this, a mouse-less zoomed child (a shell at its prompt)
+        // would get raw SGR reports typed into it.
+        out.write_all(MOUSE_OFF)?;
+        self.mouse_gate.reset();
         execute!(out, terminal::LeaveAlternateScreen, cursor::Show)?;
         if mode.contains(TermMode::ALT_SCREEN) {
             out.write_all(b"\x1b[?1049h")?;
@@ -3484,6 +4776,14 @@ impl App {
             ctevent::EnableBracketedPaste,
             cursor::Hide
         )?;
+        // The reset string above wiped every mouse mode, including vag's
+        // own capture — re-assert it for the chrome.
+        if self.cfg.ui.mouse {
+            out.write_all(MOUSE_ON)?;
+            out.flush()?;
+        }
+        self.mouse_gate.reset();
+        self.mouse_down_in_pane = false;
         term.clear()?;
         // restore pane-sized PTY (draw() will also correct it)
         if let Some(rect) = self.last_pane_rect
@@ -3521,18 +4821,18 @@ impl App {
         // codex/fork discoveries, but also fresh known-id claude sessions
         // whose transcript hasn't hit a rescan yet, and open sessions whose
         // files vanished mid-run.
-        let mut provisional: Vec<SessionKey> = self
+        let mut provisional: Vec<(SessionKey, Option<String>)> = self
             .open_order
             .iter()
             .filter(|k| !self.meta_idx.contains_key(*k))
             .filter(|k| {
                 self.show_hidden || !self.state.session(k).is_some_and(|session| session.hidden)
             })
-            .cloned()
+            .map(|key| (key.clone(), self.effective_session_folder(key)))
             .collect();
         for (k, ctx) in &self.pending {
-            if !ctx.closed && !provisional.contains(k) {
-                provisional.push(k.clone());
+            if !ctx.closed && !provisional.iter().any(|(key, _)| key == k) {
+                provisional.push((k.clone(), ctx.folder.clone()));
             }
         }
         let machines: Vec<(String, String)> = self
@@ -3541,7 +4841,13 @@ impl App {
             .iter()
             .map(|r| (r.name.clone(), r.host.clone()))
             .collect();
-        self.rows = dashboard::build_rows(
+        let mut pinned_inbox: HashSet<SessionKey> = self.runtimes.keys().cloned().collect();
+        pinned_inbox.extend(
+            self.external_claude
+                .keys()
+                .map(|id| SessionKey::new(AgentKind::Claude, id.clone())),
+        );
+        self.rows = dashboard::build_rows_with_pinned(
             &self.state,
             &self.sessions,
             &provisional,
@@ -3554,6 +4860,7 @@ impl App {
             // it here made archived sessions unreachable by default.)
             self.show_hidden,
             self.view_scope().as_deref(),
+            &pinned_inbox,
         );
         // Re-anchor the cursor to the row it was on: background rescans
         // reorder rows, and a bare index would silently select a different
@@ -3581,25 +4888,37 @@ impl App {
                 BadgeInfo {
                     kind: Badge::Exited,
                     dur: None,
+                    unread: false,
+                }
+            } else if let Some(attention) = self.activity.get(k).and_then(Activity::attention) {
+                BadgeInfo {
+                    kind: Badge::NeedsInput(attention.kind),
+                    dur: Some(attention.since.elapsed()),
+                    unread: attention.unread,
+                }
+            } else if let Some(since) = self.activity.get(k).and_then(Activity::working_since) {
+                BadgeInfo {
+                    kind: Badge::Working,
+                    // Visible Working means in-flight elapsed time. Persisted
+                    // stats remain the separate fresh-output metric.
+                    dur: Some(since.elapsed()),
+                    unread: false,
                 }
             } else {
                 match self.activity.get(k).map(|a| a.turn).unwrap_or(Turn::Idle) {
-                    Turn::Working { .. } => BadgeInfo {
-                        kind: Badge::Working,
-                        // Active output time, not wall-clock: waiting on
-                        // approvals or idle keepalives must not count.
-                        dur: self.activity.get(k).map(|a| a.active_time()),
-                    },
                     Turn::Done {
                         finished,
                         unread: true,
                     } => BadgeInfo {
                         kind: Badge::DoneUnread,
                         dur: Some(finished.elapsed()),
+                        unread: true,
                     },
+                    Turn::Working { .. } => unreachable!("working_since covers heuristic work"),
                     Turn::Done { .. } | Turn::Idle => BadgeInfo {
                         kind: Badge::Idle,
                         dur: None,
+                        unread: false,
                     },
                 }
             };
@@ -3610,6 +4929,7 @@ impl App {
             out.entry(key).or_insert(BadgeInfo {
                 kind: Badge::External,
                 dur: self.ext_working.get(id).map(Instant::elapsed),
+                unread: false,
             });
         }
         out
@@ -3618,6 +4938,12 @@ impl App {
     fn set_status(&mut self, s: String) {
         self.status = Some((s, Instant::now()));
         self.dirty = true;
+    }
+
+    fn remove_agent_settings(&mut self, key: &SessionKey) {
+        if let Some(path) = self.agent_settings.remove(key) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Save state, surfacing failures on the status line — a silently
@@ -3710,11 +5036,18 @@ impl App {
             if Some(inner) != self.last_pane_rect {
                 self.last_pane_rect = Some(inner);
             }
+            // Resize even while the diff tab hides the PTY, or the child
+            // reflows against a stale size the moment the tab flips back.
             if let Some(rt) = self.runtimes.get(&active) {
                 rt.resize(PaneSize {
                     rows: inner.height.max(2),
                     cols: inner.width.max(2),
                 });
+            }
+            // Rendering is &self; scroll/cursor bounds are settled here in
+            // the &mut prelude where the panel geometry is known.
+            if let Some(dv) = self.diff_views.get_mut(&active).filter(|d| d.shown) {
+                dv.clamp_viewport(inner);
             }
         }
 
@@ -3765,8 +5098,21 @@ impl App {
                 area,
             );
         }
-        let [header, head_rule, body, footer] = Layout::vertical([
+        let [
+            header,
+            head_rule,
+            act_cards,
+            _act_gap,
+            act_grid,
+            act_rule,
+            body,
+            footer,
+        ] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(7),
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(2),
@@ -3782,6 +5128,31 @@ impl App {
             .iter()
             .filter(|r| r.session_key().is_some())
             .count();
+        let today = Local::now().date_naive();
+        f.render_widget(
+            Paragraph::new(heatmap::stat_cards(
+                &self.activity_stats,
+                &self.theme,
+                visible_sessions,
+                today,
+                act_cards.width,
+            )),
+            act_cards,
+        );
+        // _act_gap is a deliberate blank breathing line — nothing renders there.
+        f.render_widget(
+            Paragraph::new(heatmap::calendar_grid(
+                &self.activity_stats,
+                &self.theme,
+                today,
+                act_grid.width,
+            )),
+            act_grid,
+        );
+        f.render_widget(
+            Paragraph::new(dashboard::rule_line(&self.theme, act_rule.width)),
+            act_rule,
+        );
         let mut head_spans = vec![
             Span::styled(
                 " vag ",
@@ -3963,7 +5334,17 @@ impl App {
                 f.render_widget(self.pane_titlebar(active, bar.width, focused), bar);
             }
         }
-        if let Some(rt) = self.runtimes.get(active) {
+        if let Some(dv) = self.diff_views.get(active).filter(|d| d.shown) {
+            diffview::render(
+                f,
+                inner,
+                dv,
+                self.diff_repo.get(active),
+                focused,
+                &self.theme,
+                &self.icons,
+            );
+        } else if let Some(rt) = self.runtimes.get(active) {
             pane::render(rt, inner, f.buffer_mut(), focused);
         } else {
             f.render_widget(
@@ -4071,7 +5452,8 @@ impl App {
         } else {
             let foot = if self.focus == Focus::Tree {
                 format!(
-                    " enter:show esc:dashboard {}:help",
+                    " enter:show {}:diff esc:dashboard {}:help",
+                    self.cfg.keys.get(KeyAction::DiffView),
                     self.cfg.keys.get(KeyAction::Help)
                 )
             } else {
@@ -4194,7 +5576,8 @@ impl App {
             .or_else(|| self.provisional_labels.get(key).cloned())
             .or_else(|| self.runtimes.get(key).and_then(|rt| rt.title()))
             .unwrap_or_else(|| dashboard::meta_less_title(key));
-        let exited = if self.exited.contains(key) {
+        let is_exited = self.exited.contains(key);
+        let exited = if is_exited {
             format!(
                 " [exited — {} closes]",
                 self.cfg.keys.get(KeyAction::CloseRuntime)
@@ -4202,10 +5585,12 @@ impl App {
         } else {
             String::new()
         };
-        let left = format!(" {} {}{}", self.icons.agent(key.agent), name, exited);
+        let diff_shown = self.diff_views.get(key).is_some_and(|d| d.shown);
+        let tab = if diff_shown { " · diff" } else { "" };
+        let left = format!(" {} {}{}{}", self.icons.agent(key.agent), name, tab, exited);
 
         // Identity cluster on the LEFT (project/@machine, branch — bold),
-        // status cluster on the RIGHT (active working time, created) next
+        // status cluster on the RIGHT (in-flight working time, created) next
         // to the detach hint, tmux-style. Drop priority (lowest goes first
         // on narrow bars): branch(0) → created(1) → location(2) → turn(3).
         let mut parts: Vec<BarPart> = Vec::new();
@@ -4217,22 +5602,42 @@ impl App {
         if let Some(b) = meta.and_then(|m| m.git_branch.clone()) {
             parts.push(BarPart::left(0, format!("{} {b}", self.icons.branch), true));
         }
-        match self.activity.get(key) {
-            Some(a) if matches!(a.turn, Turn::Working { .. }) => {
+        // Scrolled into history: say so, or a codex/claude repaint frozen
+        // under the reader looks like a hang. Highest keep-priority — it's
+        // the one part that explains what the pane is showing.
+        if let Some(off) = self
+            .runtimes
+            .get(key)
+            .map(|rt| rt.display_offset())
+            .filter(|&o| o > 0)
+        {
+            parts.push(BarPart::right(4, format!("scroll ↑{off}")));
+        }
+        if !is_exited {
+            if let Some(attention) = self.activity.get(key).and_then(Activity::attention) {
                 parts.push(BarPart::right(
                     3,
-                    format!("working {}", dashboard::fmt_work_dur(a.active_time())),
+                    format!(
+                        "{} {}",
+                        attention.kind.label(),
+                        dashboard::fmt_work_dur(attention.since.elapsed())
+                    ),
                 ));
-            }
-            Some(a) => {
-                if let Turn::Done { finished, .. } = a.turn {
-                    parts.push(BarPart::right(
-                        3,
-                        format!("done {}", dashboard::fmt_work_dur(finished.elapsed())),
-                    ));
+            } else {
+                match self.activity.get(key) {
+                    Some(a) if a.working_since().is_some() => {
+                        let elapsed = a.working_since().unwrap().elapsed();
+                        parts.push(BarPart::right(
+                            3,
+                            format!("working {}", dashboard::fmt_work_dur(elapsed)),
+                        ));
+                    }
+                    // This bar belongs to the attached pane. Completion is
+                    // an away-state notification and has already been
+                    // acknowledged by entering the session.
+                    Some(_) | None => {}
                 }
             }
-            None => {}
         }
         if let Some(c) = meta.and_then(|m| m.created) {
             let rel = dashboard::rel_time(Some(c), Utc::now());
@@ -4246,7 +5651,19 @@ impl App {
             ));
         }
 
-        let right_hint = format!("{}:tree ", self.cfg.keys.detach.label());
+        let right_hint = if diff_shown {
+            format!(
+                "{}:agent {}:tree ",
+                self.cfg.keys.toggle_diff.label(),
+                self.cfg.keys.detach.label()
+            )
+        } else {
+            format!(
+                "{}:diff {}:tree ",
+                self.cfg.keys.toggle_diff.label(),
+                self.cfg.keys.detach.label()
+            )
+        };
         let kept = fit_bar_parts(
             &parts,
             (width as usize)
@@ -4323,24 +5740,34 @@ impl App {
             ""
         };
         let detach = self.cfg.keys.detach.label();
+        let scroll = match self.runtimes.get(key).map(|rt| rt.display_offset()) {
+            Some(off) if off > 0 => format!(" · scroll ↑{off}"),
+            _ => String::new(),
+        };
+        let diff = if self.diff_views.get(key).is_some_and(|d| d.shown) {
+            " · diff"
+        } else {
+            ""
+        };
         format!(
-            " {} {}{} · {}:tree ",
+            " {} {}{}{}{} · {}:tree ",
             self.icons.agent(key.agent),
             name,
             exited,
+            diff,
+            scroll,
             detach
         )
     }
 }
 
 /// Visible tree rows → edit-buffer lines: the "+ new session" row is
-/// dropped, the Inbox header and unresolved `pending-*` sessions are
+/// dropped, built-in headers and unresolved `pending-*` sessions are
 /// readonly, folders carry an oil-style trailing slash, and session text is
 /// the current display title. Resolved meta-less rows remain editable.
-/// Machine headers become readonly
-/// LineId::Inbox lines ("<name>/ (machine)") so the folder-context
-/// semantics of the lines below them stay None; shell panes are readonly
-/// (labelled) provisional lines.
+/// Machine headers become readonly LineId::Inbox lines ("<name>/ (machine)")
+/// so the folder-context semantics of the lines below them stay None; shell
+/// panes are readonly (labelled) provisional lines.
 fn edit_lines_from_rows(
     rows: &[Row],
     state: &VagState,
@@ -4354,6 +5781,13 @@ fn edit_lines_from_rows(
             Row::Inbox { .. } => Some(EditLine {
                 id: LineId::Inbox,
                 text: "Inbox".into(),
+                depth: 0,
+                readonly: true,
+                copied: false,
+            }),
+            Row::Archived { .. } => Some(EditLine {
+                id: LineId::Archived,
+                text: "Archived".into(),
                 depth: 0,
                 readonly: true,
                 copied: false,
@@ -4378,6 +5812,7 @@ fn edit_lines_from_rows(
                 key,
                 depth,
                 meta_idx,
+                ..
             } => {
                 let (text, readonly) = match meta_idx {
                     // Shell panes are ephemeral: visible in the buffer (with
@@ -4541,6 +5976,13 @@ fn session_started_in_window(created: chrono::DateTime<Utc>, spawned: SystemTime
     }
 }
 
+/// Blank Codex panes stop after one lookup window; once input is sent, a
+/// durable identity is expected and exact resolver windows continue. Claude's
+/// cheap pid-registry lookup retains its historical retry behavior.
+fn retry_identity_after_timeout(agent: AgentKind, can_retry: bool, input_sent: bool) -> bool {
+    can_retry && (agent == AgentKind::Claude || input_sent)
+}
+
 /// Walk up from `start` looking for a `.git` entry (dir, or file for
 /// worktrees). No git subprocess needed.
 fn detect_git_root(start: &std::path::Path) -> Option<PathBuf> {
@@ -4655,6 +6097,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_events::{AgentEventKind, NeedsInputKind};
 
     const DETACH: u8 = 0x11; // default ctrl-q
     const TOGGLE_SIDEBAR: u8 = 0x05; // default ctrl-e
@@ -4763,6 +6206,7 @@ mod tests {
             key: skey(id),
             depth: 1,
             meta_idx: None,
+            auto_archived: false,
         }
     }
 
@@ -4856,7 +6300,12 @@ mod tests {
     fn test_app() -> (App, Receiver<AppEvent>) {
         isolate_data_dir();
         let (tx, rx) = unbounded();
-        let mut app = App::new(Config::default(), VagState::default(), tx);
+        let mut app = App::new(
+            Config::default(),
+            VagState::default(),
+            ActivityStats::default(),
+            tx,
+        );
         // Tests may themselves run inside tmux — never let an edge-nav key
         // actually move the developer's panes.
         app.tmux_nav = false;
@@ -4877,6 +6326,293 @@ mod tests {
             events.clone(),
         )
         .expect("spawning /bin/cat test child")
+    }
+
+    /// Drive a runtime's emulator with synthetic "child output" directly —
+    /// deterministic scrollback/mode state without racing the PTY reader.
+    fn feed_term(rt: &SessionRuntime, bytes: &[u8]) {
+        let mut p: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        let mut t = rt.term().lock();
+        p.advance(&mut *t, bytes);
+    }
+
+    /// An app with one active /bin/cat pane (pane-focused) whose emulator
+    /// holds `history_lines` of scrollback above a 10-row screen.
+    fn scrollback_app(history_lines: usize) -> (App, SessionKey) {
+        let (mut app, _rx) = test_app();
+        let key = SessionKey::new(AgentKind::Codex, "sess".to_string());
+        let (es, _er) = unbounded();
+        app.runtimes.insert(key.clone(), spawn_cat(&key, &es));
+        app.set_active(Some(key.clone()));
+        app.focus_pane();
+        let mut out = Vec::new();
+        for i in 0..(history_lines + 10) {
+            out.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        feed_term(app.runtimes.get(&key).unwrap(), &out);
+        assert_eq!(app.runtimes.get(&key).unwrap().display_offset(), 0);
+        (app, key)
+    }
+
+    fn kill_all(app: &mut App) {
+        for (_, mut rt) in app.runtimes.drain() {
+            rt.kill();
+        }
+    }
+
+    #[test]
+    fn codex_native_approval_latches_until_submission_or_cancel() {
+        let (mut app, _rx) = test_app();
+        let key = SessionKey::new(AgentKind::Codex, "native-osc9");
+        let (es, _er) = unbounded();
+        app.runtimes.insert(key.clone(), spawn_cat(&key, &es));
+        app.activity.insert(key.clone(), Activity::default());
+        app.set_active(Some(key.clone()));
+        app.focus_pane();
+        let mut term = test_terminal();
+        let first_notification_at = now_unix_nanos();
+
+        app.on_runtime(
+            key.clone(),
+            RuntimeEvent::NativeNotification {
+                observed_at_unix_nanos: first_notification_at,
+                message: "Approval requested: cargo test".into(),
+            },
+            &mut term,
+        )
+        .unwrap();
+        assert_eq!(
+            app.activity.get(&key).unwrap().attention().unwrap().kind,
+            NeedsInputKind::Approval
+        );
+        assert!(matches!(
+            app.badges().get(&key).map(|b| b.kind),
+            Some(Badge::NeedsInput(NeedsInputKind::Approval))
+        ));
+
+        app.forward_with_detach(b"x", &mut term).unwrap();
+        assert!(
+            app.activity.get(&key).unwrap().attention().is_some(),
+            "partial typing cannot resolve a wait"
+        );
+        app.forward_with_detach(b"\x1b", &mut term).unwrap();
+        app.forward_with_detach(b"[A", &mut term).unwrap();
+        assert!(
+            app.activity.get(&key).unwrap().attention().is_some(),
+            "split menu navigation cannot resolve a wait"
+        );
+        app.forward_with_detach(b"\x1b[200~one\ntwo\x1b[201~", &mut term)
+            .unwrap();
+        assert!(
+            app.activity.get(&key).unwrap().attention().is_some(),
+            "multiline bracketed paste inserts text without submitting"
+        );
+        app.forward_with_detach(b"\x1b", &mut term).unwrap();
+        assert!(app.activity.get(&key).unwrap().attention().is_some());
+        let escape_at = app.pane_attention_escape.as_ref().unwrap().2;
+        app.pane_attention_escape.as_mut().unwrap().1 = Instant::now() - PANE_ESC_QUIET;
+        assert!(app.resolve_pending_pane_escape_if_due());
+        assert!(
+            app.activity.get(&key).unwrap().attention().is_none(),
+            "a standalone Esc cancels after the sequence ambiguity window"
+        );
+        assert!(
+            app.activity.get(&key).unwrap().working_since().is_none(),
+            "cancel dismisses the wait without claiming work resumed"
+        );
+
+        let notification_at = escape_at.saturating_add(1);
+        app.on_runtime(
+            key.clone(),
+            RuntimeEvent::NativeNotification {
+                observed_at_unix_nanos: notification_at,
+                message: "Approval requested by github".into(),
+            },
+            &mut term,
+        )
+        .unwrap();
+        assert!(app.activity.get(&key).unwrap().attention().is_some());
+        app.forward_with_detach(b"\r", &mut term).unwrap();
+        assert!(app.activity.get(&key).unwrap().attention().is_none());
+        assert!(matches!(
+            app.badges().get(&key).map(|badge| badge.kind),
+            Some(Badge::Working)
+        ));
+        app.on_runtime(
+            key.clone(),
+            RuntimeEvent::NativeNotification {
+                observed_at_unix_nanos: notification_at,
+                message: "Approval requested by github".into(),
+            },
+            &mut term,
+        )
+        .unwrap();
+        assert!(
+            app.activity.get(&key).unwrap().attention().is_none(),
+            "a queued pre-submission notification cannot re-latch"
+        );
+
+        app.on_runtime(key.clone(), RuntimeEvent::Bell, &mut term)
+            .unwrap();
+        assert!(
+            app.activity.get(&key).unwrap().attention().is_none(),
+            "ordinary Codex bells have no notification provenance"
+        );
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn codex_native_completion_restores_done_badge() {
+        let (mut app, _rx) = test_app();
+        let key = SessionKey::new(AgentKind::Codex, "native-complete");
+        let (es, _er) = unbounded();
+        app.runtimes.insert(key.clone(), spawn_cat(&key, &es));
+        app.activity.insert(key.clone(), Activity::default());
+        let mut term = test_terminal();
+
+        app.on_runtime(
+            key.clone(),
+            RuntimeEvent::NativeNotification {
+                observed_at_unix_nanos: now_unix_nanos(),
+                message: "Implemented the requested changes.".into(),
+            },
+            &mut term,
+        )
+        .unwrap();
+
+        assert!(app.activity.get(&key).unwrap().attention().is_none());
+        assert!(matches!(
+            app.badges().get(&key).map(|badge| badge.kind),
+            Some(Badge::DoneUnread)
+        ));
+        assert!(app.badges().get(&key).unwrap().unread);
+
+        app.set_active(Some(key.clone()));
+
+        assert!(matches!(
+            app.badges().get(&key).map(|badge| badge.kind),
+            Some(Badge::Idle)
+        ));
+        assert!(matches!(
+            app.activity.get(&key).map(|activity| activity.turn),
+            Some(Turn::Done { unread: false, .. })
+        ));
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn codex_completion_is_hidden_when_session_is_already_focused() {
+        let (mut app, _rx) = test_app();
+        let key = SessionKey::new(AgentKind::Codex, "focused-complete");
+        let (es, _er) = unbounded();
+        app.runtimes.insert(key.clone(), spawn_cat(&key, &es));
+        app.activity.insert(key.clone(), Activity::default());
+        app.set_active(Some(key.clone()));
+        app.focus_pane();
+        let mut term = test_terminal();
+
+        app.on_runtime(
+            key.clone(),
+            RuntimeEvent::NativeNotification {
+                observed_at_unix_nanos: now_unix_nanos(),
+                message: "Implemented the requested changes.".into(),
+            },
+            &mut term,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.activity.get(&key).map(|activity| activity.turn),
+            Some(Turn::Done { unread: false, .. })
+        ));
+        assert!(matches!(
+            app.badges().get(&key).map(|badge| badge.kind),
+            Some(Badge::Idle)
+        ));
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn attached_pane_titlebar_does_not_show_completed_turn() {
+        let (mut app, _rx) = test_app();
+        let key = SessionKey::new(AgentKind::Codex, "attached-complete");
+        app.provisional_labels
+            .insert(key.clone(), "attached session".into());
+        let mut activity = Activity::default();
+        activity.turn = Turn::Done {
+            finished: Instant::now(),
+            unread: true,
+        };
+        app.activity.insert(key.clone(), activity);
+
+        app.set_active(Some(key.clone()));
+
+        let area = Rect::new(0, 0, 100, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            app.pane_titlebar(&key, area.width, true),
+            area,
+            &mut buffer,
+        );
+        let rendered: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(!rendered.contains("done"), "titlebar was: {rendered}");
+    }
+
+    #[test]
+    fn claude_bell_is_not_misread_as_a_native_attention_event() {
+        let (mut app, _rx) = test_app();
+        let key = SessionKey::new(AgentKind::Claude, "plain-bell");
+        let (es, _er) = unbounded();
+        app.runtimes.insert(key.clone(), spawn_cat(&key, &es));
+        app.activity.insert(key.clone(), Activity::default());
+        let mut term = test_terminal();
+
+        app.on_runtime(key.clone(), RuntimeEvent::Bell, &mut term)
+            .unwrap();
+        assert!(app.activity.get(&key).unwrap().attention().is_none());
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn native_event_uses_runtime_alias_and_late_packet_cannot_make_a_ghost() {
+        let (mut app, _rx) = test_app();
+        let provisional = SessionKey::new(AgentKind::Claude, "pending-native");
+        let real = SessionKey::new(AgentKind::Claude, "real-native");
+        let (es, _er) = unbounded();
+        app.runtimes.insert(real.clone(), spawn_cat(&real, &es));
+        app.activity.insert(real.clone(), Activity::default());
+        app.runtime_aliases
+            .insert(provisional.clone(), real.clone());
+        let event = AgentEvent {
+            observed_at_unix_nanos: 1,
+            kind: AgentEventKind::NeedsInput {
+                kind: NeedsInputKind::Question,
+                request_id: Some("q1".into()),
+            },
+        };
+        let mut term = test_terminal();
+
+        app.on_runtime(
+            provisional.clone(),
+            RuntimeEvent::Agent(event.clone()),
+            &mut term,
+        )
+        .unwrap();
+        assert_eq!(
+            app.activity.get(&real).unwrap().attention().unwrap().kind,
+            NeedsInputKind::Question
+        );
+
+        let mut runtime = app.runtimes.remove(&real).unwrap();
+        runtime.kill();
+        app.activity.remove(&real);
+        app.on_runtime(provisional, RuntimeEvent::Agent(event), &mut term)
+            .unwrap();
+        assert!(
+            !app.activity.contains_key(&real),
+            "late hook packet must not recreate closed runtime activity"
+        );
     }
 
     #[test]
@@ -4929,6 +6665,24 @@ mod tests {
         let real = SessionKey::new(AgentKind::Codex, "real-named".to_string());
         let (events, _event_rx) = unbounded();
         app.runtimes.insert(prov.clone(), spawn_cat(&prov, &events));
+        let private_dir = tempfile::tempdir().unwrap();
+        let private_settings = private_dir.path().join("claude-settings.json");
+        std::fs::write(&private_settings, "{}").unwrap();
+        app.agent_settings
+            .insert(prov.clone(), private_settings.clone());
+        let mut native_activity = Activity::default();
+        native_activity.on_agent_event(
+            AgentEvent {
+                observed_at_unix_nanos: 1,
+                kind: AgentEventKind::NeedsInput {
+                    kind: NeedsInputKind::Approval,
+                    request_id: None,
+                },
+            },
+            Instant::now(),
+            false,
+        );
+        app.activity.insert(prov.clone(), native_activity);
         app.open_order.push(prov.clone());
         app.active = Some(prov.clone());
         app.provisional_labels
@@ -4939,7 +6693,7 @@ mod tests {
         );
         app.editbuf = Some(EditBuf::new(vec![EditLine {
             id: LineId::Session(prov.clone()),
-            text: "(starting…)".into(),
+            text: "codex session".into(),
             depth: 1,
             readonly: true,
             copied: false,
@@ -4951,6 +6705,16 @@ mod tests {
 
         assert!(!app.pending.contains_key(&prov));
         assert!(app.runtimes.contains_key(&real));
+        assert_eq!(
+            app.agent_settings.get(&real),
+            Some(&private_settings),
+            "runtime-owned settings migrate with a provisional id"
+        );
+        assert_eq!(
+            app.activity.get(&real).unwrap().attention().unwrap().kind,
+            NeedsInputKind::Approval,
+            "native attention migrates with the provisional runtime"
+        );
         assert_eq!(app.active.as_ref(), Some(&real));
         assert_eq!(app.rows[app.cursor].session_key(), Some(&real));
         assert_eq!(app.runtime_aliases.get(&prov), Some(&real));
@@ -4979,6 +6743,8 @@ mod tests {
             .unwrap();
         assert!(app.exited.contains(&real));
         assert!(!app.exited.contains(&prov));
+        assert!(!private_settings.exists());
+        assert!(!app.agent_settings.contains_key(&real));
 
         app.close_runtime(&real);
         assert!(!app.runtime_aliases.contains_key(&prov));
@@ -5034,14 +6800,14 @@ mod tests {
     }
 
     #[test]
-    fn late_scan_reconciles_multiple_pending_sessions_one_to_one() {
+    fn late_scan_reconciles_multiple_pending_claude_sessions_one_to_one() {
         let (mut app, _rx) = test_app();
         app.scoped = false;
         let cwd = tempfile::tempdir().unwrap();
         let first_launch = SystemTime::now();
         let second_launch = first_launch + Duration::from_secs(2);
-        let first_prov = SessionKey::new(AgentKind::Codex, "pending-first");
-        let second_prov = SessionKey::new(AgentKind::Codex, "pending-second");
+        let first_prov = SessionKey::new(AgentKind::Claude, "pending-first");
+        let second_prov = SessionKey::new(AgentKind::Claude, "pending-second");
         let (events, _event_rx) = unbounded();
         for (key, launch, name) in [
             (&first_prov, first_launch, "first"),
@@ -5055,9 +6821,9 @@ mod tests {
             app.open_order.push(key.clone());
         }
 
-        let first_real = SessionKey::new(AgentKind::Codex, "real-first");
-        let second_real = SessionKey::new(AgentKind::Codex, "real-second");
-        let prior_real = SessionKey::new(AgentKind::Codex, "real-prior");
+        let first_real = SessionKey::new(AgentKind::Claude, "real-first");
+        let second_real = SessionKey::new(AgentKind::Claude, "real-second");
+        let prior_real = SessionKey::new(AgentKind::Claude, "real-prior");
         let mut prior_meta = meta_for(&prior_real, "existing session");
         prior_meta.cwd = cwd.path().to_path_buf();
         prior_meta.created = Some(chrono::DateTime::<Utc>::from(
@@ -5098,6 +6864,37 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_scan_never_guesses_a_pending_codex_identity() {
+        let (mut app, _rx) = test_app();
+        app.scoped = false;
+        let cwd = tempfile::tempdir().unwrap();
+        let launch = SystemTime::now();
+        let provisional = SessionKey::new(AgentKind::Codex, "pending-codex");
+        let unrelated = SessionKey::new(AgentKind::Codex, "same-cwd-user-thread");
+        let (events, _event_rx) = unbounded();
+        let mut ctx = PendingCtx::new(None, Some("mine"));
+        ctx.cwd = cwd.path().to_path_buf();
+        ctx.spawned_after = launch;
+        app.pending.insert(provisional.clone(), ctx);
+        app.runtimes
+            .insert(provisional.clone(), spawn_cat(&provisional, &events));
+        app.open_order.push(provisional.clone());
+
+        let mut meta = meta_for(&unrelated, "other interactive thread");
+        meta.cwd = cwd.path().to_path_buf();
+        meta.created = Some(chrono::DateTime::<Utc>::from(
+            launch + Duration::from_millis(50),
+        ));
+        app.on_scan_done(scan_with(vec![meta]));
+
+        assert!(app.pending.contains_key(&provisional));
+        assert!(app.runtimes.contains_key(&provisional));
+        assert!(!app.runtimes.contains_key(&unrelated));
+        assert!(app.state.session(&unrelated).is_none());
+        app.close_runtime(&provisional);
+    }
+
+    #[test]
     fn session_start_window_handles_legacy_seconds_without_previous_second() {
         let launch = SystemTime::UNIX_EPOCH + Duration::from_millis(10_900);
         let same_second = chrono::DateTime::<Utc>::from_timestamp(10, 0).unwrap();
@@ -5113,7 +6910,32 @@ mod tests {
     }
 
     #[test]
-    fn state_actions_guarded_on_provisional_rows() {
+    fn pending_input_queues_retry_and_refreshes_a_stale_codex_window() {
+        let (mut app, _rx) = test_app();
+        let provisional = SessionKey::new(AgentKind::Codex, "pending-input-race");
+        let stale = SystemTime::now() - actions::CODEX_ID_START_WINDOW - Duration::from_secs(1);
+        let mut ctx = PendingCtx::new(None, None);
+        ctx.codex_search_after = stale;
+        ctx.discovering = true; // input arrives during the startup worker
+        app.pending.insert(provisional.clone(), ctx);
+
+        app.write_to(&provisional, b"first prompt\r");
+
+        let ctx = app.pending.get(&provisional).unwrap();
+        assert!(ctx.input_sent, "the in-flight worker must not lose input");
+        assert!(ctx.discovering, "no duplicate worker is launched");
+        assert!(
+            ctx.codex_search_after > stale,
+            "a prompt after the original 120s window gets a fresh boundary"
+        );
+        assert!(retry_identity_after_timeout(AgentKind::Codex, true, true));
+        assert!(!retry_identity_after_timeout(AgentKind::Codex, true, false));
+        assert!(retry_identity_after_timeout(AgentKind::Claude, true, false));
+        assert!(!retry_identity_after_timeout(AgentKind::Codex, false, true));
+    }
+
+    #[test]
+    fn safe_pending_edits_are_queued_but_store_actions_stay_guarded() {
         let (mut app, _rx) = test_app();
         let prov = SessionKey::new(AgentKind::Codex, "pending-xyz789".to_string());
         app.pending
@@ -5122,9 +6944,17 @@ mod tests {
         app.cursor = locate_row(&app.rows, &RowAnchor::Session(prov.clone())).unwrap();
 
         app.start_move_session();
-        assert!(app.modal.is_none(), "move must be blocked");
+        assert!(
+            matches!(app.modal, Some(Modal::PickFolder { .. })),
+            "move can queue folder intent without persisting the pending key"
+        );
+        app.modal = None;
         app.start_rename();
-        assert!(app.modal.is_none(), "rename must be blocked");
+        assert!(
+            matches!(app.modal, Some(Modal::Input { .. })),
+            "rename can queue a display name until identity resolves"
+        );
+        app.modal = None;
         app.start_archive();
         assert!(app.modal.is_none(), "archive must be blocked");
         // toggle_hidden (d) shares the same guard; exercise it directly so
@@ -5138,6 +6968,65 @@ mod tests {
         assert!(app.status.is_some());
     }
 
+    #[test]
+    fn pending_move_and_rename_render_now_and_persist_after_resolution() {
+        let (mut app, _rx) = test_app();
+        app.scoped = false;
+        let folder = app.state.create_folder("work", None).unwrap();
+        let provisional = SessionKey::new(AgentKind::Codex, "pending-organize");
+        let real = SessionKey::new(AgentKind::Codex, "real-organized");
+        app.pending
+            .insert(provisional.clone(), PendingCtx::new(None, None));
+        app.open_order.push(provisional.clone());
+        app.rebuild_rows();
+
+        app.commit_session_folder(provisional.clone(), Some(folder.clone()));
+        app.commit_session_name(provisional.clone(), "  untitled work  ".into());
+
+        let pending = app.pending.get(&provisional).unwrap();
+        assert_eq!(pending.folder.as_deref(), Some(folder.as_str()));
+        assert_eq!(pending.name_override.as_deref(), Some("untitled work"));
+        assert!(app.state.session(&provisional).is_none());
+        let folder_row = locate_row(&app.rows, &RowAnchor::Folder(folder.clone())).unwrap();
+        let session_row = locate_row(&app.rows, &RowAnchor::Session(provisional.clone())).unwrap();
+        assert!(
+            session_row > folder_row,
+            "pending row renders in its folder"
+        );
+
+        app.on_id_resolved(provisional.clone(), Some(real.id.clone()));
+        let saved = app.state.session(&real).unwrap();
+        assert_eq!(saved.folder.as_deref(), Some(folder.as_str()));
+        assert_eq!(saved.name_override.as_deref(), Some("untitled work"));
+        assert!(app.state.session(&provisional).is_none());
+        assert!(
+            app.rows.iter().any(|row| row.session_key() == Some(&real)),
+            "resolved meta-less row remains reachable in the folder"
+        );
+    }
+
+    #[test]
+    fn deleting_folder_reparents_pending_session_intent() {
+        let (mut app, _rx) = test_app();
+        let parent = app.state.create_folder("parent", None).unwrap();
+        let child = app.state.create_folder("child", Some(&parent)).unwrap();
+        let provisional = SessionKey::new(AgentKind::Codex, "pending-in-child");
+        app.pending.insert(
+            provisional.clone(),
+            PendingCtx::new(Some(child.clone()), None),
+        );
+
+        app.delete_folder_and_reparent_pending(&child).unwrap();
+
+        assert!(app.state.folder(&child).is_none());
+        assert_eq!(
+            app.pending
+                .get(&provisional)
+                .and_then(|ctx| ctx.folder.as_deref()),
+            Some(parent.as_str())
+        );
+    }
+
     // ---------- floating tree (ui.tree = "float") ----------
 
     fn float_app() -> (App, Receiver<AppEvent>) {
@@ -5145,7 +7034,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ui.tree = TreeMode::Float;
         let (tx, rx) = unbounded();
-        (App::new(cfg, VagState::default(), tx), rx)
+        (
+            App::new(cfg, VagState::default(), ActivityStats::default(), tx),
+            rx,
+        )
     }
 
     #[test]
@@ -5209,6 +7101,43 @@ mod tests {
         app.focus_tree();
         assert!(!app.tree_float);
         assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn automatic_archive_starts_collapsed_and_toggles_open() {
+        let (mut app, _rx) = test_app();
+        app.scoped = false;
+        let key = skey("old-inbox-session");
+        let mut old = meta_for(&key, "old");
+        old.last_activity = Some(Utc::now() - chrono::Duration::days(4));
+        app.sessions = vec![old];
+        index_sessions(&mut app);
+        app.rebuild_rows();
+
+        let archived = locate_row(&app.rows, &RowAnchor::Archived).unwrap();
+        assert!(matches!(
+            app.rows[archived],
+            Row::Archived {
+                count: 1,
+                collapsed: true
+            }
+        ));
+        assert!(app.rows.iter().all(|row| row.session_key() != Some(&key)));
+
+        app.cursor = archived;
+        app.toggle_collapse();
+        let archived = locate_row(&app.rows, &RowAnchor::Archived).unwrap();
+        assert!(matches!(
+            app.rows[archived],
+            Row::Archived {
+                count: 1,
+                collapsed: false
+            }
+        ));
+        assert!(matches!(
+            &app.rows[archived + 1],
+            Row::Session { key: child, auto_archived: true, .. } if child == &key
+        ));
     }
 
     #[test]
@@ -5337,16 +7266,19 @@ mod tests {
                 key: prov.clone(),
                 depth: 1,
                 meta_idx: None,
+                auto_archived: false,
             },
             Row::Session {
                 key: shell.clone(),
                 depth: 1,
                 meta_idx: None,
+                auto_archived: false,
             },
             Row::Session {
                 key: k2.clone(),
                 depth: 1,
                 meta_idx: Some(1),
+                auto_archived: false,
             },
             Row::Machine {
                 name: "gpu".into(),
@@ -5367,6 +7299,7 @@ mod tests {
                 key: k1.clone(),
                 depth: 1,
                 meta_idx: Some(0),
+                auto_archived: false,
             },
         ];
         let lines = edit_lines_from_rows(&rows, &st, &sessions, &labels);
@@ -5377,7 +7310,7 @@ mod tests {
         assert!(lines[0].readonly);
         // provisional session: readonly placeholder
         assert_eq!(lines[1].id, LineId::Session(prov));
-        assert_eq!(lines[1].text, "(starting…)");
+        assert_eq!(lines[1].text, "claude session");
         assert!(lines[1].readonly);
         // shell pane: readonly, labelled
         assert_eq!(lines[2].id, LineId::Session(shell));
@@ -5399,6 +7332,32 @@ mod tests {
         assert!(!lines[5].readonly);
         assert_eq!(lines[6].id, LineId::Session(k1));
         assert_eq!(lines[6].text, "one");
+    }
+
+    #[test]
+    fn automatic_archive_is_a_readonly_edit_group() {
+        let st = VagState::default();
+        let key = skey("old");
+        let sessions = vec![meta_for(&key, "old")];
+        let rows = vec![
+            Row::Archived {
+                count: 1,
+                collapsed: false,
+            },
+            Row::Session {
+                key: key.clone(),
+                depth: 1,
+                meta_idx: Some(0),
+                auto_archived: true,
+            },
+        ];
+        let lines = edit_lines_from_rows(&rows, &st, &sessions, &HashMap::new());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].id, LineId::Archived);
+        assert_eq!(lines[0].text, "Archived");
+        assert!(lines[0].readonly);
+        assert_eq!(lines[1].id, LineId::Session(key));
+        assert_eq!(lines[1].depth, 1);
     }
 
     #[test]
@@ -5502,14 +7461,20 @@ mod tests {
         app.scoped = false; // tests run inside a repo; /tmp cwds must show
         let k1 = skey("aaa");
         let k2 = skey("bbb");
+        let folder = app.state.create_folder("work", None).unwrap();
+        app.state.set_session_folder(&k1, Some(&folder)).unwrap();
         app.sessions = vec![meta_for(&k1, "one"), meta_for(&k2, "two")];
         index_sessions(&mut app);
         app.rebuild_rows();
-        app.cursor = app.rows.len() - 1;
+        app.cursor = locate_row(&app.rows, &RowAnchor::Inbox).unwrap();
         app.enter_edit_mode();
         let buf = app.editbuf.as_ref().unwrap();
-        assert_eq!(buf.lines().len(), app.rows.len() - 2); // minus button + spacer
-        assert_eq!(buf.cursor().0, buf.lines().len() - 1);
+        assert_eq!(buf.lines().len(), 4); // folder, session, Inbox, session
+        assert_eq!(
+            buf.cursor().0,
+            2,
+            "interior spacers do not offset the cursor"
+        );
         // re-entry is a no-op while a buffer is live
         app.enter_edit_mode();
         assert!(app.editbuf.is_some());
@@ -5664,7 +7629,10 @@ mod tests {
     fn app_with_cfg(cfg: Config) -> (App, Receiver<AppEvent>) {
         isolate_data_dir();
         let (tx, rx) = unbounded();
-        (App::new(cfg, VagState::default(), tx), rx)
+        (
+            App::new(cfg, VagState::default(), ActivityStats::default(), tx),
+            rx,
+        )
     }
 
     /// A config whose agent commands point at paths that can never exist,
@@ -6194,16 +8162,30 @@ mod tests {
         let (mut app, _rx) = test_app();
         app.scoped = false;
         let k1 = skey("aaa");
-        app.sessions = vec![meta_for(&k1, "one")];
+        let k2 = skey("bbb");
+        let folder = app.state.create_folder("work", None).unwrap();
+        app.state.set_session_folder(&k1, Some(&folder)).unwrap();
+        app.sessions = vec![meta_for(&k1, "one"), meta_for(&k2, "two")];
         index_sessions(&mut app);
         app.rebuild_rows();
-        // rows: + new session, spacer, Inbox, session
+        // The initial breathing line is skipped in both directions.
         assert!(matches!(app.rows[1], Row::Spacer));
         app.cursor = 0;
         app.move_cursor(1);
         assert_eq!(app.cursor, 2, "j from the button skips the spacer");
         app.move_cursor(-1);
         assert_eq!(app.cursor, 0, "k back over it too");
+
+        // The same holds for the gap between the folder subtree and Inbox.
+        app.cursor = locate_row(&app.rows, &RowAnchor::Session(k1.clone())).unwrap();
+        app.move_cursor(1);
+        assert!(matches!(app.rows[app.cursor], Row::Inbox { .. }));
+        app.move_cursor(-1);
+        assert_eq!(
+            app.rows[app.cursor].session_key(),
+            Some(&k1),
+            "k skips the interior spacer"
+        );
     }
 
     #[test]
@@ -6354,13 +8336,283 @@ mod tests {
         }
     }
 
+    // ---------- scrolling: PgUp/PgDn + mouse wheel ----------
+
+    #[test]
+    fn pgup_scrolls_primary_screen_pane_and_pgdn_returns() {
+        let (mut app, key) = scrollback_app(30);
+        let mut term = test_terminal();
+        app.on_stdin(PAGE_UP.to_vec(), &mut term).unwrap();
+        assert_eq!(
+            app.runtimes.get(&key).unwrap().display_offset(),
+            20,
+            "pane-focused PgUp scrolls the emulator scrollback"
+        );
+        app.on_stdin(PAGE_DOWN.to_vec(), &mut term).unwrap();
+        assert_eq!(app.runtimes.get(&key).unwrap().display_offset(), 0);
+        assert_eq!(app.focus, Focus::Pane, "scrolling never moves focus");
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn pgup_inside_paste_is_forwarded_not_intercepted() {
+        let (mut app, key) = scrollback_app(30);
+        let mut term = test_terminal();
+        let mut bytes = PASTE_START.to_vec();
+        bytes.extend_from_slice(PAGE_UP);
+        bytes.extend_from_slice(PASTE_END);
+        app.on_stdin(bytes, &mut term).unwrap();
+        assert_eq!(
+            app.runtimes.get(&key).unwrap().display_offset(),
+            0,
+            "a literal PgUp sequence in pasted content must reach the child"
+        );
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn pgup_on_alt_screen_child_is_forwarded() {
+        let (mut app, key) = scrollback_app(30);
+        // Child enters the alternate screen (codex's ctrl+t overlay, vim…).
+        feed_term(app.runtimes.get(&key).unwrap(), b"\x1b[?1049h");
+        let before = app.runtimes.get(&key).unwrap().last_output();
+        let mut term = test_terminal();
+        app.on_stdin(PAGE_UP.to_vec(), &mut term).unwrap();
+        assert_eq!(
+            app.runtimes.get(&key).unwrap().display_offset(),
+            0,
+            "no interception on the alt screen"
+        );
+        // The sequence reached the child: cat echoes it back through the
+        // PTY, which bumps last_output.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.runtimes.get(&key).unwrap().last_output() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "PgUp bytes never reached the alt-screen child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn wheel_over_pane_scrolls_scrollback() {
+        let (mut app, key) = scrollback_app(30);
+        // Full-width pane: coordinates well inside it on any screen size.
+        app.sidebar_hidden = true;
+        let mut term = test_terminal();
+        app.on_stdin(b"\x1b[<64;10;5M".to_vec(), &mut term).unwrap();
+        assert_eq!(
+            app.runtimes.get(&key).unwrap().display_offset(),
+            3,
+            "wheel up = 3 lines back"
+        );
+        app.on_stdin(b"\x1b[<65;10;5M".to_vec(), &mut term).unwrap();
+        assert_eq!(app.runtimes.get(&key).unwrap().display_offset(), 0);
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn diff_toggle_byte_flips_tab_and_reroutes_input() {
+        let (mut app, key) = scrollback_app(5);
+        let mut term = test_terminal();
+        assert!(app.pane_raw_mode());
+        // Ctrl-G in pane focus: intercepted by forward_with_detach, never
+        // forwarded — the diff tab comes up and raw forwarding stops.
+        app.on_stdin(vec![0x07], &mut term).unwrap();
+        assert!(app.diff_views.get(&key).is_some_and(|d| d.shown));
+        assert!(!app.pane_raw_mode(), "diff tab owns input now");
+        assert_eq!(app.focus, Focus::Pane);
+        // Keys now land in the view, not the child; the toggle chord flips
+        // straight back to the agent tab.
+        app.on_key(Key::Char('j'), &mut term).unwrap();
+        assert!(app.diff_views.get(&key).is_some_and(|d| d.shown));
+        app.on_key(Key::Ctrl('g'), &mut term).unwrap();
+        assert!(!app.diff_views.get(&key).is_some_and(|d| d.shown));
+        assert!(app.pane_raw_mode(), "agent tab forwards raw bytes again");
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn diff_view_esc_returns_to_agent_and_detach_reaches_tree() {
+        let (mut app, key) = scrollback_app(5);
+        let mut term = test_terminal();
+        app.toggle_diff(&key);
+        assert!(app.diff_views.get(&key).is_some_and(|d| d.shown));
+        // The detach chord keeps its meaning: sidebar focus, diff stays up
+        // (mirrors an unfocused agent pane).
+        app.on_key(Key::Ctrl('q'), &mut term).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.diff_views.get(&key).is_some_and(|d| d.shown));
+        app.focus_pane();
+        app.on_key(Key::Esc, &mut term).unwrap();
+        assert!(
+            !app.diff_views.get(&key).is_some_and(|d| d.shown),
+            "esc closes the diff tab back to the agent"
+        );
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn diff_action_from_tree_needs_open_runtime_and_activates_it() {
+        let (mut app, key) = scrollback_app(5);
+        let mut term = test_terminal();
+        app.focus_tree();
+        app.on_key(Key::Char('D'), &mut term).unwrap();
+        assert!(
+            app.diff_views.get(&key).is_some_and(|d| d.shown),
+            "D toggles the active session's diff view"
+        );
+        assert_eq!(app.focus, Focus::Pane);
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn ctrl_e_in_diff_view_toggles_sidebar_and_ctrl_g_switches_from_tree() {
+        let (mut app, key) = scrollback_app(5);
+        let mut term = test_terminal();
+        app.toggle_diff(&key);
+        assert!(app.diff_views.get(&key).is_some_and(|d| d.shown));
+        // ctrl-e keeps its meaning on the diff tab (sidebar view toggle).
+        assert!(!app.sidebar_hidden);
+        app.on_key(Key::Ctrl('e'), &mut term).unwrap();
+        assert!(app.sidebar_hidden);
+        app.on_key(Key::Ctrl('e'), &mut term).unwrap();
+        assert!(!app.sidebar_hidden);
+        assert!(
+            app.diff_views.get(&key).is_some_and(|d| d.shown),
+            "sidebar toggle must not leave the diff tab"
+        );
+        // The tab-switch chord also works from tree focus, landing in the
+        // pane on whichever tab it switched to.
+        app.focus_tree();
+        app.on_key(Key::Ctrl('g'), &mut term).unwrap();
+        assert!(!app.diff_views.get(&key).is_some_and(|d| d.shown));
+        assert_eq!(app.focus, Focus::Pane);
+        app.focus_tree();
+        app.on_key(Key::Ctrl('g'), &mut term).unwrap();
+        assert!(app.diff_views.get(&key).is_some_and(|d| d.shown));
+        assert_eq!(app.focus, Focus::Pane);
+        // Every fresh show starts in the file tree, even after the reader
+        // moved into the body last time.
+        {
+            let dv = app.diff_views.get_mut(&key).unwrap();
+            dv.focus = DiffFocus::Body;
+        }
+        app.toggle_diff(&key); // hide
+        app.toggle_diff(&key); // show again
+        assert_eq!(app.diff_views.get(&key).unwrap().focus, DiffFocus::Tree);
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn spawn_records_and_persists_base_commit() {
+        let (mut app, _rx) = test_app();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("f.txt"), "hi\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let key = SessionKey::new(AgentKind::Codex, "diffbase".to_string());
+        let spec = actions::SpawnSpec {
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: repo.path().to_path_buf(),
+            env: vec![],
+        };
+        app.spawn_runtime(key.clone(), &spec, None);
+        let rc = app.diff_repo.get(&key).expect("repo ctx captured at spawn");
+        assert!(rc.root.is_some());
+        let base = rc.base.clone().expect("HEAD recorded as base");
+        assert_eq!(
+            app.state
+                .session(&key)
+                .and_then(|s| s.base_commit.as_deref()),
+            Some(base.as_str()),
+            "durable ids persist their first-open base"
+        );
+        let recorded_at = app
+            .state
+            .session(&key)
+            .and_then(|s| s.base_recorded_at)
+            .expect("first open stamps the base time");
+        // A later respawn must keep the FIRST base, not re-record — and
+        // anchor the transcript scanner at the first open, so the
+        // agent-files scope survives vag restarts instead of resetting.
+        std::fs::write(repo.path().join("f.txt"), "changed\n").unwrap();
+        git(&["commit", "-qam", "second"]);
+        app.close_runtime(&key);
+        assert!(
+            !app.diff_repo.contains_key(&key),
+            "close cleans diff state"
+        );
+        app.spawn_runtime(key.clone(), &spec, None);
+        let rc = app.diff_repo.get(&key).unwrap();
+        assert_eq!(rc.base, Some(base), "persisted base survives reopen");
+        assert_eq!(
+            rc.spawned_at, recorded_at,
+            "scanner anchor is the FIRST open, not this spawn"
+        );
+        kill_all(&mut app);
+    }
+
+    #[test]
+    fn wheel_over_dashboard_moves_tree_cursor() {
+        let (mut app, _rx) = test_app();
+        app.rebuild_rows();
+        assert_eq!(app.cursor, 0);
+        let mut term = test_terminal();
+        app.on_stdin(b"\x1b[<65;5;5M".to_vec(), &mut term).unwrap();
+        assert!(app.cursor > 0, "wheel down moves the cursor like j");
+        app.on_stdin(b"\x1b[<64;5;5M".to_vec(), &mut term).unwrap();
+        assert_eq!(app.cursor, 0, "wheel up moves it back");
+    }
+
+    #[test]
+    fn mouse_disabled_forwards_wheel_bytes_to_child() {
+        let (mut app, key) = scrollback_app(30);
+        app.cfg.ui.mouse = false;
+        app.sidebar_hidden = true;
+        let mut term = test_terminal();
+        app.on_stdin(b"\x1b[<64;10;5M".to_vec(), &mut term).unwrap();
+        assert_eq!(
+            app.runtimes.get(&key).unwrap().display_offset(),
+            0,
+            "ui.mouse=false: reports pass through untouched"
+        );
+        kill_all(&mut app);
+    }
+
     #[test]
     fn ctrl_h_focuses_tree_from_pane() {
         let (mut app, _rx) = test_app();
-        let key = SessionKey::new(AgentKind::Codex, "sess".to_string());
+        app.scoped = false; // tests run inside a repo; /tmp cwds must show
+        let key = SessionKey::new(AgentKind::Codex, "active".to_string());
+        let other = SessionKey::new(AgentKind::Codex, "other".to_string());
+        app.sessions = vec![meta_for(&key, "active"), meta_for(&other, "other")];
+        index_sessions(&mut app);
+        app.rebuild_rows();
         let (es, _er) = unbounded();
         app.runtimes.insert(key.clone(), spawn_cat(&key, &es));
-        app.set_active(Some(key));
+        app.set_active(Some(key.clone()));
+        app.cursor = locate_row(&app.rows, &RowAnchor::Session(other)).unwrap();
         app.focus_pane();
         assert_eq!(app.focus, Focus::Pane);
 
@@ -6368,6 +8620,11 @@ mod tests {
         app.dirty = false;
         app.on_stdin(vec![FOCUS_TREE], &mut term).unwrap();
         assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(
+            app.rows[app.cursor].session_key(),
+            Some(&key),
+            "returning from the pane selects its attached session row"
+        );
         assert!(
             app.dirty,
             "the focus move must request a repaint — without it ctrl-h feels dead"

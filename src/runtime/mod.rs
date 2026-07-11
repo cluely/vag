@@ -33,6 +33,7 @@
 //!     * Event::ChildExit / EOF → RuntimeEvent::Exited (also delivered when
 //!       the reader thread sees EOF and reaps the child).
 //!     * Event::Bell → RuntimeEvent::Bell.
+//!     * OSC 9 notification → RuntimeEvent::NativeNotification.
 //! - Synchronized updates: alacritty's vte handles mode 2026 internally
 //!   (buffers until commit) — the pane just renders current Term state on
 //!   Wakeup; no extra gating needed beyond wakeup coalescing.
@@ -63,7 +64,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -75,6 +76,7 @@ use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::actions::SpawnSpec;
+use crate::agent_events::AgentEvent;
 use crate::types::SessionKey;
 
 #[derive(Debug, Clone)]
@@ -85,7 +87,17 @@ pub enum RuntimeEvent {
     Exited(Option<i32>),
     /// OSC title change from the child.
     Title,
+    /// Dedicated OSC 9 desktop notification. Vag configures Codex to use
+    /// this transport; retaining its bounded payload lets the app distinguish
+    /// normal completion from approval/plan attention without screen text.
+    NativeNotification {
+        observed_at_unix_nanos: u64,
+        message: String,
+    },
     Bell,
+    /// Provider-native lifecycle transition from the Claude hook relay,
+    /// routed under this runtime's immutable key.
+    Agent(AgentEvent),
 }
 
 /// Size in character cells.
@@ -603,6 +615,11 @@ impl SessionRuntime {
         self.shared.send_wakeup();
     }
 
+    /// Lines the view is currently scrolled back into history (0 = live).
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
+    }
+
     pub fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Relaxed)
     }
@@ -782,6 +799,131 @@ fn writer_thread(rx: Receiver<Vec<u8>>, mut writer: Box<dyn Write + Send>) {
     }
 }
 
+const OSC_NOTIFICATION_MAX: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+enum Osc9State {
+    Ground,
+    Escape,
+    Code { value: u16, digits: u8 },
+    Payload,
+    PayloadEscape,
+    Ignored,
+    IgnoredEscape,
+}
+
+/// Chunk-safe recognizer for `OSC 9 ; message (BEL|ST)`. The emulator
+/// intentionally ignores OSC 9, so observing it in parallel does not alter
+/// the bytes painted or teed during zoom. Payloads are retained only until
+/// their terminator and remain bounded by `OSC_NOTIFICATION_MAX`.
+struct Osc9Scanner {
+    state: Osc9State,
+    payload: Vec<u8>,
+}
+
+impl Default for Osc9Scanner {
+    fn default() -> Self {
+        Self {
+            state: Osc9State::Ground,
+            payload: Vec::new(),
+        }
+    }
+}
+
+impl Osc9Scanner {
+    fn finish_payload(&mut self, messages: &mut Vec<String>) {
+        if !self.payload.is_empty() {
+            messages.push(String::from_utf8_lossy(&self.payload).into_owned());
+        }
+        self.payload.clear();
+    }
+
+    fn advance(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut messages = Vec::new();
+        for &byte in bytes {
+            self.state = match self.state {
+                Osc9State::Ground => {
+                    if byte == 0x1b {
+                        Osc9State::Escape
+                    } else {
+                        Osc9State::Ground
+                    }
+                }
+                Osc9State::Escape => match byte {
+                    b']' => Osc9State::Code {
+                        value: 0,
+                        digits: 0,
+                    },
+                    0x1b => Osc9State::Escape,
+                    _ => Osc9State::Ground,
+                },
+                Osc9State::Code { value, digits } => match byte {
+                    b'0'..=b'9' if digits < 4 => Osc9State::Code {
+                        value: value * 10 + u16::from(byte - b'0'),
+                        digits: digits + 1,
+                    },
+                    b';' if digits > 0 && value == 9 => {
+                        self.payload.clear();
+                        Osc9State::Payload
+                    }
+                    0x07 => Osc9State::Ground,
+                    0x1b => Osc9State::IgnoredEscape,
+                    _ => Osc9State::Ignored,
+                },
+                Osc9State::Payload => match byte {
+                    0x07 => {
+                        self.finish_payload(&mut messages);
+                        Osc9State::Ground
+                    }
+                    0x1b => Osc9State::PayloadEscape,
+                    _ if self.payload.len() < OSC_NOTIFICATION_MAX => {
+                        self.payload.push(byte);
+                        Osc9State::Payload
+                    }
+                    _ => {
+                        self.payload.clear();
+                        Osc9State::Ignored
+                    }
+                },
+                Osc9State::PayloadEscape => match byte {
+                    b'\\' | 0x07 => {
+                        self.finish_payload(&mut messages);
+                        Osc9State::Ground
+                    }
+                    0x1b => Osc9State::PayloadEscape,
+                    _ if self.payload.len() < OSC_NOTIFICATION_MAX => {
+                        self.payload.push(byte);
+                        Osc9State::Payload
+                    }
+                    _ => {
+                        self.payload.clear();
+                        Osc9State::Ignored
+                    }
+                },
+                Osc9State::Ignored => match byte {
+                    0x07 => Osc9State::Ground,
+                    0x1b => Osc9State::IgnoredEscape,
+                    _ => Osc9State::Ignored,
+                },
+                Osc9State::IgnoredEscape => match byte {
+                    b'\\' | 0x07 => Osc9State::Ground,
+                    0x1b => Osc9State::IgnoredEscape,
+                    _ => Osc9State::Ignored,
+                },
+            };
+        }
+        messages
+    }
+}
+
+fn unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
 fn reader_thread(
     shared: Arc<Shared>,
     term: Arc<FairMutex<Term<EventProxy>>>,
@@ -790,6 +932,7 @@ fn reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
 ) {
     let mut processor: Processor = Processor::new();
+    let mut osc9 = Osc9Scanner::default();
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
@@ -797,6 +940,23 @@ fn reader_thread(
             Ok(0) => break,
             Ok(n) => {
                 let chunk = &buf[..n];
+                let notifications = osc9.advance(chunk);
+                if !notifications.is_empty() {
+                    let mut observed_at_unix_nanos = unix_nanos();
+                    for message in notifications {
+                        let _ = shared.events.send((
+                            shared.key.clone(),
+                            RuntimeEvent::NativeNotification {
+                                observed_at_unix_nanos,
+                                message,
+                            },
+                        ));
+                        // Preserve source order even on clocks whose
+                        // observable resolution returns the same value for
+                        // this whole chunk.
+                        observed_at_unix_nanos = observed_at_unix_nanos.saturating_add(1);
+                    }
+                }
                 shared.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
                 if let Some(f) = lock(&shared.raw_log).as_mut() {
                     let _ = f.write_all(chunk);
@@ -1346,6 +1506,43 @@ mod tests {
         assert_eq!(*lock(&proxy.0.title), Some("hi".to_string()));
         proxy.send_event(Event::ResetTitle);
         assert_eq!(*lock(&proxy.0.title), None);
+    }
+
+    #[test]
+    fn osc9_notifications_are_chunk_safe_and_distinct_from_bell() {
+        let mut scanner = Osc9Scanner::default();
+        assert!(scanner.advance(b"plain\x07bell").is_empty());
+        assert!(
+            scanner
+                .advance(b"\x1b]8;;https://example.com\x1b\\")
+                .is_empty()
+        );
+        assert!(scanner.advance(b"\x1b]9;\x07").is_empty());
+        assert!(scanner.advance(b"\x1b]9;Codex needs").is_empty());
+        assert_eq!(
+            scanner.advance(b" attention\x07"),
+            ["Codex needs attention"]
+        );
+        assert!(scanner.advance(b"tail\x1b]9;second").is_empty());
+        assert_eq!(scanner.advance(b"\x1b\\"), ["second"]);
+        assert_eq!(
+            scanner.advance(b"\x1bPtmux;\x1b\x1b]9;wrapped\x07\x1b\\"),
+            ["wrapped"]
+        );
+        assert_eq!(
+            scanner.advance(b"\x1b]9;one\x07\x1b]9;two\x1b\\"),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn osc9_overlong_payload_is_discarded_and_scanner_recovers() {
+        let mut scanner = Osc9Scanner::default();
+        let mut overlong = b"\x1b]9;".to_vec();
+        overlong.extend(std::iter::repeat_n(b'x', OSC_NOTIFICATION_MAX + 1));
+        overlong.push(0x07);
+        assert!(scanner.advance(&overlong).is_empty());
+        assert_eq!(scanner.advance(b"\x1b]9;next\x07"), ["next"]);
     }
 
     #[test]

@@ -145,8 +145,10 @@ fine, since we show the real TUI).
 ### Status badges (no screen-scraping)
 - `●` running + output in last ~3s (agent working) · `◌` running, quiet (likely waiting for
   input) · no badge: not attached. Claude cross-check via the `~/.claude/sessions/<pid>.json`
-  registry. Later (opt-in): claude Notification/Stop hooks pinging a vag socket for precise
-  "needs attention" states.
+  registry. Local Claude sessions vag launches add post-fact lifecycle hooks that ping a private
+  vag socket for approvals, elicitations, and idle input; Codex TUI notifications emit OSC 9 for
+  completion, approvals, and plan questions (including through SSH). The quiet-output model
+  stays as the compatibility fallback.
 
 ## 4. UX flow
 
@@ -228,9 +230,10 @@ overlay, codex archive integration, error surfaces (missing project dir on resum
 installed, version too old — codex fork needs ≥0.137), README, brew tap + `cargo install`, CI
 (macOS + Linux).
 
-Later: fs-watch live refresh (`notify`), claude hooks for precise attention badges, kitty
-keyboard passthrough, mouse support, session search across content (`history.jsonl` sources),
-worktree-aware workflows, codex `--remote`/app-server structured events.
+Later: fs-watch live refresh (`notify`), kitty keyboard passthrough, mouse support, session
+search across content (`history.jsonl` sources), worktree-aware workflows, and Codex
+`--remote`/app-server structured events for reason-specific attention beyond the current OSC 9
+signal.
 
 ## 7. Top risks & mitigations
 

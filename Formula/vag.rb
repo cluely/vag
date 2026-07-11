@@ -15,6 +15,10 @@ class Vag < Formula
   head "https://github.com/OWNER/vag.git", branch: "main"
 
   depends_on "rust" => :build
+  # The diff view renders through delta when present (syntax highlighting,
+  # the user's own delta themes). vag falls back to its builtin renderer
+  # without it, but the default experience should ship batteries-included.
+  depends_on "git-delta"
 
   def install
     system "cargo", "install", *std_cargo_args

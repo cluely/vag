@@ -66,4 +66,10 @@ case ":$PATH:" in
     *) say "note: $INSTALL_DIR is not on your PATH — add it to your shell profile" ;;
 esac
 
+# The diff view renders through delta when available (syntax highlighting,
+# your own delta themes); vag works without it via a builtin renderer.
+if ! command -v delta >/dev/null 2>&1; then
+    say "optional: install delta for richer diffs (brew install git-delta)"
+fi
+
 say "run \`vag doctor\` to verify your claude/codex setup, then \`vag\` to start"

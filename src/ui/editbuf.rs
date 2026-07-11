@@ -19,7 +19,7 @@
 //!   ON a folder line inserts the pasted line as its first child; on any
 //!   other line, as a sibling below. Depths are recomputed on insert; the
 //!   user never edits indentation.
-//! - Readonly lines (Inbox header, provisional "(starting…)" sessions) can
+//! - Readonly lines (Inbox header, provisional agent sessions) can
 //!   be moved past but not edited, deleted, or duplicated; mutating keys on
 //!   them are no-ops with a message event.
 //! - Folder lines display as `name/` (trailing slash, oil-style); editing
@@ -52,6 +52,8 @@ pub enum LineId {
     Folder(String),
     /// The Inbox pseudo-folder header (readonly).
     Inbox,
+    /// The automatic Archived pseudo-folder header (readonly).
+    Archived,
     /// A line the user created in this editing session (candidate folder).
     New,
 }
@@ -165,7 +167,7 @@ fn folder_name(text: &str) -> String {
 }
 
 /// Folder context per line: the nearest line above with a smaller depth
-/// whose id is a Folder (→ Some) or the Inbox (→ None). Smaller-depth
+/// whose id is a Folder (→ Some) or a built-in group (→ None). Smaller-depth
 /// session/New lines are skipped, so members of a `dd`-ed folder (their
 /// depth left dangling) attach to the next folder above, or the top level.
 fn contexts(lines: &[EditLine]) -> Vec<Option<String>> {
@@ -180,7 +182,7 @@ fn contexts(lines: &[EditLine]) -> Vec<Option<String>> {
                     }
                     match &l.id {
                         LineId::Folder(f) => Some(Some(f.clone())),
-                        LineId::Inbox => Some(None),
+                        LineId::Inbox | LineId::Archived => Some(None),
                         _ => None, // dangling depth: keep walking upward
                     }
                 })
@@ -803,7 +805,7 @@ impl EditBuf {
         };
         if above {
             (self.row, cur.depth)
-        } else if matches!(cur.id, LineId::Folder(_) | LineId::Inbox) {
+        } else if matches!(cur.id, LineId::Folder(_) | LineId::Inbox | LineId::Archived) {
             (self.row + 1, cur.depth + 1)
         } else {
             (self.row + 1, cur.depth)

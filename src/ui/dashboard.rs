@@ -13,6 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::agent_events::NeedsInputKind;
 use crate::state::VagState;
 use crate::types::{AgentKind, SessionKey, SessionMeta};
 use crate::ui::editbuf::{EditBuf, LineId, Mode};
@@ -27,11 +28,13 @@ pub enum Badge {
     None,
     /// A command is in flight (BadgeInfo::dur = working for how long).
     Working,
-    /// The turn finished while the user wasn't viewing the session
-    /// (dur = how long ago); cleared on view.
+    /// The turn completed while away (dur = how long ago). Cleared on view.
     DoneUnread,
     /// Open in vag, waiting for input, already seen.
     Idle,
+    /// Provider-native attention state; unlike Idle this is known to be a
+    /// real question, approval, or completed turn rather than PTY silence.
+    NeedsInput(NeedsInputKind),
     /// Child process exited but the pane is still open.
     Exited,
     /// Running outside vag (claude live registry); dur = working for how
@@ -48,6 +51,13 @@ impl Badge {
             Badge::Working => ("●", Color::Green),
             Badge::DoneUnread => (icons.badge_done_unread, Color::Cyan),
             Badge::Idle => (icons.badge_idle, Color::DarkGray),
+            Badge::NeedsInput(NeedsInputKind::NextPrompt) => (icons.badge_done_unread, Color::Cyan),
+            Badge::NeedsInput(NeedsInputKind::Approval | NeedsInputKind::PlanApproval) => {
+                ("!", Color::Yellow)
+            }
+            Badge::NeedsInput(
+                NeedsInputKind::Input | NeedsInputKind::Question | NeedsInputKind::Elicitation,
+            ) => ("?", Color::Magenta),
             Badge::Exited => (icons.badge_exited, Color::Red),
             Badge::External => (icons.badge_external, Color::Magenta),
         }
@@ -58,8 +68,9 @@ impl Badge {
 pub enum Row {
     /// The "+ new session" button row pinned above everything.
     NewSession,
-    /// A blank breathing line between the buttons and the tree. Never
-    /// selectable: move_cursor steps over it, row actions can't hit it.
+    /// A blank breathing line between the buttons and the tree, or after the
+    /// last visible child of an expanded top-level group. Never selectable:
+    /// move_cursor steps over it, row actions can't hit it.
     Spacer,
     Folder {
         id: String,
@@ -74,6 +85,9 @@ pub enum Row {
     },
     /// The pseudo-folder for unassigned sessions.
     Inbox { count: usize, collapsed: bool },
+    /// Built-in smart folder for otherwise-unassigned sessions whose latest
+    /// known activity is more than three days old.
+    Archived { count: usize, collapsed: bool },
     /// One configured `[[remotes]]` machine, always shown (even empty — the
     /// group itself is the discoverability). Members are that machine's
     /// unfoldered remote sessions; foldered ones stay in their folders.
@@ -89,6 +103,9 @@ pub enum Row {
         /// Index into the app's session list; None for provisional runtimes
         /// (codex id not discovered yet) which have no scan entry.
         meta_idx: Option<usize>,
+        /// True only for children of the automatic Archived smart folder.
+        /// This is distinct from SessionMeta::archived (Codex-native state).
+        auto_archived: bool,
     },
     /// Placeholder shown under an expanded folder that holds nothing, so an
     /// empty folder reads as "opened but empty" rather than a dead row.
@@ -161,6 +178,7 @@ pub fn session_color(state: &VagState, key: &SessionKey) -> Option<Color> {
 }
 
 pub const INBOX_ID: &str = "\u{0}inbox"; // collapse-set key for the pseudo-folder
+pub const ARCHIVED_ID: &str = "\u{0}archived"; // automatic Archived pseudo-folder
 
 /// Collapse-set key for a machine group (NUL-prefixed like INBOX_ID so it
 /// can never collide with a real folder id).
@@ -168,24 +186,86 @@ pub fn machine_collapse_key(name: &str) -> String {
     format!("\u{0}machine:{name}")
 }
 
-/// Build visible rows. `provisional` = open runtimes with no scan entry yet
-/// (requested/state labels when known, otherwise "(starting…)").
+/// Build visible rows. `provisional` = open runtimes with no scan entry yet,
+/// paired with the folder they should render under (requested/state labels
+/// supply their title elsewhere; `None` means Inbox). Invalid folder ids fall
+/// back to Inbox, matching scanned-session behavior.
 /// `machines` = configured `[[remotes]]` as (name, host); each gets an
 /// always-visible group (scope-exempt like remote sessions) holding that
 /// machine's unfoldered remote sessions.
 /// `scope` = only show sessions whose cwd is inside this root (git-repo
 /// scoping), and only folders that contain such sessions or are bound there.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_rows(
     state: &VagState,
     sessions: &[SessionMeta],
-    provisional: &[SessionKey],
+    provisional: &[(SessionKey, Option<String>)],
     machines: &[(String, String)],
     collapsed: &HashSet<String>,
     filter: Option<&str>,
     show_hidden: bool,
     show_archived: bool,
     scope: Option<&std::path::Path>,
+) -> Vec<Row> {
+    build_rows_at(
+        state,
+        sessions,
+        provisional,
+        machines,
+        collapsed,
+        filter,
+        show_hidden,
+        show_archived,
+        scope,
+        &HashSet::new(),
+        Utc::now(),
+    )
+}
+
+/// App-facing row builder. Open Vag runtimes and externally running Claude
+/// sessions are pinned to Inbox even when their store timestamps are old.
+#[allow(clippy::too_many_arguments)]
+pub fn build_rows_with_pinned(
+    state: &VagState,
+    sessions: &[SessionMeta],
+    provisional: &[(SessionKey, Option<String>)],
+    machines: &[(String, String)],
+    collapsed: &HashSet<String>,
+    filter: Option<&str>,
+    show_hidden: bool,
+    show_archived: bool,
+    scope: Option<&std::path::Path>,
+    pinned_inbox: &HashSet<SessionKey>,
+) -> Vec<Row> {
+    build_rows_at(
+        state,
+        sessions,
+        provisional,
+        machines,
+        collapsed,
+        filter,
+        show_hidden,
+        show_archived,
+        scope,
+        pinned_inbox,
+        Utc::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_rows_at(
+    state: &VagState,
+    sessions: &[SessionMeta],
+    provisional: &[(SessionKey, Option<String>)],
+    machines: &[(String, String)],
+    collapsed: &HashSet<String>,
+    filter: Option<&str>,
+    show_hidden: bool,
+    show_archived: bool,
+    scope: Option<&std::path::Path>,
+    pinned_inbox: &HashSet<SessionKey>,
+    now: DateTime<Utc>,
 ) -> Vec<Row> {
     // filter mode: flat list of matching sessions, no folders
     if let Some(q) = filter {
@@ -199,28 +279,57 @@ pub fn build_rows(
                     || display_title(state, m).to_lowercase().contains(&q)
                     || m.project_label().to_lowercase().contains(&q)
             })
-            .map(|(i, m)| Row::Session {
-                key: m.key.clone(),
-                depth: 0,
-                meta_idx: Some(i),
+            .map(|(i, m)| {
+                let has_folder = state
+                    .session(&m.key)
+                    .and_then(|r| r.folder.as_deref())
+                    .is_some_and(|id| state.folder(id).is_some());
+                let has_machine = state
+                    .session(&m.key)
+                    .and_then(|r| r.remote.as_deref())
+                    .is_some_and(|name| machines.iter().any(|(n, _)| n == name));
+                Row::Session {
+                    key: m.key.clone(),
+                    depth: 0,
+                    meta_idx: Some(i),
+                    auto_archived: !has_folder
+                        && !has_machine
+                        && inactive_for_auto_archive(state, m, pinned_inbox, now),
+                }
             })
             .collect();
         // Open meta-less panes are reachability handles, not ordinary search
         // results. Keep them visible under any filter until discovery gives
         // them searchable metadata.
-        rows.extend(provisional.iter().cloned().map(|key| Row::Session {
-            key,
+        rows.extend(provisional.iter().map(|(key, _)| Row::Session {
+            key: key.clone(),
             depth: 0,
             meta_idx: None,
+            auto_archived: false,
         }));
         return rows;
     }
 
-    // group session indices by folder id (validated against existing
-    // folders); unfoldered remote sessions of a configured machine group
-    // under that machine instead of the Inbox.
-    let mut by_folder: HashMap<Option<String>, Vec<usize>> = HashMap::new();
+    // Group both scanned sessions and meta-less open runtimes by folder id
+    // (validated against existing folders). Keeping them in the same map is
+    // important: a newly resolved Codex runtime can have durable folder
+    // state before its rollout is discoverable, and must move immediately
+    // rather than appearing stuck in Inbox until the next successful scan.
+    let mut by_folder: HashMap<Option<String>, Vec<GroupedSession>> = HashMap::new();
     let mut by_machine: HashMap<&str, Vec<usize>> = HashMap::new();
+    // Meta-less rows historically render before scanned Inbox members. Add
+    // them first so preserving folder membership doesn't change that stable
+    // ordering.
+    for (key, intended_folder) in provisional {
+        let folder = intended_folder
+            .clone()
+            .filter(|id| state.folder(id).is_some());
+        by_folder.entry(folder).or_default().push(GroupedSession {
+            key: key.clone(),
+            meta_idx: None,
+            auto_archived: false,
+        });
+    }
     for (i, m) in sessions.iter().enumerate() {
         if !visible(state, m, show_hidden, show_archived, scope) {
             continue;
@@ -238,7 +347,13 @@ pub fn build_rows(
             by_machine.entry(machine.0.as_str()).or_default().push(i);
             continue;
         }
-        by_folder.entry(folder).or_default().push(i);
+        let auto_archived =
+            folder.is_none() && inactive_for_auto_archive(state, m, pinned_inbox, now);
+        by_folder.entry(folder).or_default().push(GroupedSession {
+            key: m.key.clone(),
+            meta_idx: Some(i),
+            auto_archived,
+        });
     }
 
     // A spacer under the button keeps the tree from reading as one dense
@@ -246,12 +361,11 @@ pub fn build_rows(
     let mut rows = vec![Row::NewSession, Row::Spacer];
     // User folders on top — a newly created folder sits above the Inbox even
     // when empty, so organizing feels immediate.
-    push_folder_level(
-        state, sessions, &by_folder, collapsed, None, 0, scope, &mut rows,
-    );
+    push_folder_level(state, &by_folder, collapsed, None, 0, scope, &mut rows);
     // Machine groups next. ALWAYS shown — an empty group is what teaches that
     // the machine exists.
     for (name, host) in machines {
+        pad_expanded_group_tail(&mut rows);
         let members = by_machine.get(name.as_str()).cloned().unwrap_or_default();
         let is_collapsed = collapsed.contains(&machine_collapse_key(name));
         rows.push(Row::Machine {
@@ -266,6 +380,7 @@ pub fn build_rows(
                     key: sessions[i].key.clone(),
                     depth: 1,
                     meta_idx: Some(i),
+                    auto_archived: false,
                 });
             }
         }
@@ -273,31 +388,96 @@ pub fn build_rows(
     // Inbox last: the unfiled catch-all. Shown when it has sessions, or when
     // there are no folders at all (so an empty tree still has an anchor).
     let inbox = by_folder.get(&None).cloned().unwrap_or_default();
+    let (archived, inbox): (Vec<_>, Vec<_>) =
+        inbox.into_iter().partition(|member| member.auto_archived);
     let inbox_collapsed = collapsed.contains(INBOX_ID);
-    let inbox_count = inbox.len() + provisional.len();
+    let inbox_count = inbox.len();
     if inbox_count > 0 || state.folders.is_empty() {
+        pad_expanded_group_tail(&mut rows);
         rows.push(Row::Inbox {
             count: inbox_count,
             collapsed: inbox_collapsed,
         });
         if !inbox_collapsed {
-            for key in provisional {
+            for member in inbox {
                 rows.push(Row::Session {
-                    key: key.clone(),
+                    key: member.key,
                     depth: 1,
-                    meta_idx: None,
+                    meta_idx: member.meta_idx,
+                    auto_archived: false,
                 });
             }
-            for i in inbox {
+        }
+    }
+    // Archived is a smart partition of Inbox, not a persisted destination.
+    // It appears only when it has members and starts collapsed in App::new.
+    if !archived.is_empty() {
+        pad_expanded_group_tail(&mut rows);
+        let archived_collapsed = collapsed.contains(ARCHIVED_ID);
+        rows.push(Row::Archived {
+            count: archived.len(),
+            collapsed: archived_collapsed,
+        });
+        if !archived_collapsed {
+            for member in archived {
                 rows.push(Row::Session {
-                    key: sessions[i].key.clone(),
+                    key: member.key,
                     depth: 1,
-                    meta_idx: Some(i),
+                    meta_idx: member.meta_idx,
+                    auto_archived: true,
                 });
             }
         }
     }
     rows
+}
+
+/// More than 72 hours since the newest trustworthy activity signal. Missing
+/// and future timestamps stay in Inbox; opening a session refreshes
+/// `last_opened`, and live sessions are pinned separately by the app.
+fn inactive_for_auto_archive(
+    state: &VagState,
+    meta: &SessionMeta,
+    pinned_inbox: &HashSet<SessionKey>,
+    now: DateTime<Utc>,
+) -> bool {
+    if pinned_inbox.contains(&meta.key) {
+        return false;
+    }
+    let last_opened = state.session(&meta.key).and_then(|r| r.last_opened);
+    [
+        meta.last_activity,
+        meta.last_user_activity,
+        meta.created,
+        last_opened,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .is_some_and(|last| last < now - chrono::Duration::days(3))
+}
+
+/// Give an expanded top-level group one breathing row after its final visible
+/// child. Collapsed and childless groups end at their header, so their next
+/// sibling stays adjacent instead of looking separated by an empty container.
+/// The initial tree spacer is preserved independently above the first group.
+fn pad_expanded_group_tail(rows: &mut Vec<Row>) {
+    let ends_in_visible_child = match rows.last() {
+        Some(Row::Folder { depth, .. })
+        | Some(Row::Session { depth, .. })
+        | Some(Row::Empty { depth, .. }) => *depth > 0,
+        _ => false,
+    };
+    if ends_in_visible_child {
+        rows.push(Row::Spacer);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GroupedSession {
+    key: SessionKey,
+    meta_idx: Option<usize>,
+    auto_archived: bool,
 }
 
 fn visible(
@@ -334,7 +514,7 @@ fn visible(
 /// folders surface only in the unfiltered view.
 fn folder_in_scope(
     state: &VagState,
-    by_folder: &HashMap<Option<String>, Vec<usize>>,
+    by_folder: &HashMap<Option<String>, Vec<GroupedSession>>,
     id: &str,
     scope: &std::path::Path,
 ) -> bool {
@@ -365,8 +545,7 @@ fn folder_in_scope(
 #[allow(clippy::too_many_arguments)]
 fn push_folder_level(
     state: &VagState,
-    sessions: &[SessionMeta],
-    by_folder: &HashMap<Option<String>, Vec<usize>>,
+    by_folder: &HashMap<Option<String>, Vec<GroupedSession>>,
     collapsed: &HashSet<String>,
     parent: Option<&str>,
     depth: usize,
@@ -378,6 +557,9 @@ fn push_folder_level(
             && !folder_in_scope(state, by_folder, &f.id, root)
         {
             continue;
+        }
+        if depth == 0 {
+            pad_expanded_group_tail(rows);
         }
         let members = by_folder
             .get(&Some(f.id.clone()))
@@ -402,16 +584,16 @@ fn push_folder_level(
         });
         if !is_collapsed {
             let before = rows.len();
-            for i in members {
+            for member in members {
                 rows.push(Row::Session {
-                    key: sessions[i].key.clone(),
+                    key: member.key,
                     depth: depth + 1,
-                    meta_idx: Some(i),
+                    meta_idx: member.meta_idx,
+                    auto_archived: member.auto_archived,
                 });
             }
             push_folder_level(
                 state,
-                sessions,
                 by_folder,
                 collapsed,
                 Some(&f.id),
@@ -433,7 +615,7 @@ fn push_folder_level(
 
 fn count_recursive(
     state: &VagState,
-    by_folder: &HashMap<Option<String>, Vec<usize>>,
+    by_folder: &HashMap<Option<String>, Vec<GroupedSession>>,
     id: &str,
 ) -> usize {
     let own = by_folder
@@ -466,11 +648,10 @@ pub fn state_name(state: &VagState, key: &SessionKey) -> Option<String> {
 }
 
 pub fn meta_less_title(key: &SessionKey) -> String {
-    if key.id.starts_with("pending-") {
-        "(starting…)".to_string()
-    } else {
-        format!("{} session", key.agent.label())
-    }
+    // A provisional pane is already usable. Calling it "starting" makes an
+    // intentionally blank Codex TUI look hung while its durable UUID is
+    // learned in the background.
+    format!("{} session", key.agent.label())
 }
 
 pub fn rel_time(t: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
@@ -493,11 +674,13 @@ pub fn rel_time(t: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
 }
 
 /// Badge plus the live metadata rendered next to it. `dur` meaning depends
-/// on kind: Working/External = working for; DoneUnread = finished ago.
+/// on kind: Working/External = working for; DoneUnread = finished ago;
+/// NeedsInput = waiting for. `unread` is meaningful for semantic attention.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BadgeInfo {
     pub kind: Badge,
     pub dur: Option<std::time::Duration>,
+    pub unread: bool,
 }
 
 /// Braille spinner shown while a session is actively producing output.
@@ -533,7 +716,7 @@ pub struct RowCtx<'a> {
     /// Resolved glyph set (ascii/nerd), chosen once by the app from config.
     pub icons: &'a Icons,
     /// Display titles for provisional runtimes with no scan entry (requested
-    /// agent names or shell labels); fallback is "(starting…)".
+    /// agent names or shell labels); fallback is a neutral agent label.
     pub provisional_labels: &'a HashMap<SessionKey, String>,
     /// Active color theme: ALL chrome text in the tree (buttons, folder
     /// names, project labels, timestamps, highlights) keys off this — never
@@ -549,8 +732,8 @@ fn session_line(
     narrow: bool,
     width: usize,
 ) -> Line<'static> {
-    // +1: groups/buttons share the base padding; sessions sit one deeper.
-    let indent = "  ".repeat(depth + 1);
+    let attached = Some(key) == ctx.active;
+    let color = session_color(ctx.state, key);
     let info = ctx.badges.get(key).copied().unwrap_or_default();
     let (bg, bc) = match info.kind {
         // Working sessions animate; the glyph cycles with the app tick.
@@ -562,9 +745,10 @@ fn session_line(
         (Badge::Working, Some(d)) => Some(format!("working {}", fmt_work_dur(d))),
         (Badge::DoneUnread, Some(d)) => Some(format!("done {}", fmt_work_dur(d))),
         (Badge::External, Some(d)) => Some(format!("working {}", fmt_work_dur(d))),
+        (Badge::NeedsInput(kind), Some(d)) => Some(format!("{} {}", kind.label(), fmt_work_dur(d))),
         _ => None,
     };
-    let unread = info.kind == Badge::DoneUnread;
+    let unread = info.unread;
     let (title, project, time, hidden, archived) = match meta_idx {
         Some(i) => {
             let m = &ctx.sessions[i];
@@ -602,41 +786,73 @@ fn session_line(
         .map(|i| format!("{} ", i + 1))
         .unwrap_or_default();
 
-    let mut spans = vec![Span::raw(indent), agent_icon];
-    if !quick.is_empty() {
-        spans.push(Span::styled(quick, Style::new().fg(ctx.theme.dim)));
-    }
+    // In the sidebar, reserve the existing two-column base padding for an
+    // attached-session rail. Replacing (rather than adding to) the padding
+    // keeps every title aligned and leaves the narrow width budget intact.
+    let mut spans = if narrow && attached {
+        vec![
+            Span::styled("▌ ", Style::new().fg(color.unwrap_or(ctx.theme.accent))),
+            Span::raw("  ".repeat(depth)),
+        ]
+    } else {
+        // +1: groups/buttons share the base padding; sessions sit one deeper.
+        vec![Span::raw("  ".repeat(depth + 1))]
+    };
+    spans.push(agent_icon);
     let mut tstyle = Style::new();
-    if let Some(c) = session_color(ctx.state, key) {
+    if let Some(c) = color {
         tstyle = tstyle.fg(c);
     }
-    if Some(key) == ctx.active || unread {
+    if attached || unread {
         tstyle = tstyle.add_modifier(Modifier::BOLD);
     }
     if hidden || archived {
         tstyle = tstyle.fg(ctx.theme.dim);
     }
     if narrow {
-        // Compact live indicator: "⠹ 4m32s" / "● 2m" (dur only, no words).
+        // Compact but explicit live indicator: "⠹ working 4m32s" /
+        // "● done 2m" / "! approval 12s". The suffix is built and measured
+        // first; only the remaining terminal cells belong to the title.
         let compact = match (info.kind, info.dur) {
-            (Badge::Working | Badge::DoneUnread | Badge::External, Some(d)) => {
-                Some(fmt_work_dur(d))
+            (Badge::Working, Some(d)) => Some(format!("working {}", fmt_work_dur(d))),
+            (Badge::DoneUnread, Some(d)) => Some(format!("done {}", fmt_work_dur(d))),
+            (Badge::External, Some(d)) => Some(format!("working {}", fmt_work_dur(d))),
+            (Badge::NeedsInput(kind), Some(d)) => {
+                Some(format!("{} {}", kind.short_label(), fmt_work_dur(d)))
             }
             _ => None,
         };
-        let ind_width = compact.as_ref().map(|d| d.chars().count() + 3).unwrap_or(2);
-        spans.push(Span::styled(
-            truncate(&title, width.saturating_sub(depth * 2 + 4 + ind_width)),
-            tstyle,
-        ));
+        let mut suffix = Vec::new();
         if !bg.is_empty() {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(bg.to_string(), Style::new().fg(bc)));
-            if let Some(d) = compact {
-                spans.push(Span::styled(format!(" {d}"), Style::new().fg(bc)));
+            suffix.push(Span::raw(" "));
+            suffix.push(Span::styled(bg.to_string(), Style::new().fg(bc)));
+            if let Some(label) = compact {
+                suffix.push(Span::styled(format!(" {label}"), Style::new().fg(bc)));
             }
         }
+        let suffix_width: usize = suffix.iter().map(Span::width).sum();
+        let prefix_width: usize = spans.iter().map(Span::width).sum();
+        if !quick.is_empty()
+            && prefix_width + Span::raw(quick.as_str()).width() + suffix_width <= width
+        {
+            spans.push(Span::styled(quick, Style::new().fg(ctx.theme.dim)));
+        }
+        let mut prefix_width: usize = spans.iter().map(Span::width).sum();
+        // At pathological/nested minimum widths, fixed chrome can itself be
+        // wider than the row. Status is the non-negotiable information: shed
+        // optional prefix spans from the right before allowing its tail to
+        // be clipped.
+        while prefix_width + suffix_width > width && !spans.is_empty() {
+            spans.pop();
+            prefix_width = spans.iter().map(Span::width).sum();
+        }
+        let title_width = width.saturating_sub(prefix_width + suffix_width);
+        spans.push(Span::styled(truncate_width(&title, title_width), tstyle));
+        spans.extend(suffix);
     } else {
+        if !quick.is_empty() {
+            spans.push(Span::styled(quick, Style::new().fg(ctx.theme.dim)));
+        }
         spans.push(Span::styled(truncate(&title, 48), tstyle));
         let remote = ctx.state.session(key).and_then(|r| r.remote.clone());
         if let Some(rname) = remote {
@@ -790,6 +1006,29 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Truncate to terminal cells rather than Unicode scalar count. Sidebar
+/// budgeting must match Ratatui's renderer or wide titles can steal cells
+/// reserved for the trailing status label.
+fn truncate_width(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if Span::raw(s).width() <= max {
+        return s.to_string();
+    }
+    let content_width = max.saturating_sub(Span::raw("…").width());
+    let mut out = String::new();
+    for ch in s.chars() {
+        out.push(ch);
+        if Span::raw(out.as_str()).width() > content_width {
+            out.pop();
+            break;
+        }
+    }
+    out.push('…');
+    out
+}
+
 /// A dim full-width hairline: separates the chrome (header above, pinned
 /// settings below) from the scrolling tree so the regions read apart.
 pub fn rule_line(th: &Theme, width: u16) -> Line<'static> {
@@ -816,7 +1055,7 @@ pub fn settings_line(
         Style::new().fg(th.dim),
     ));
     if selected {
-        let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        let used = line.width();
         let fill = (width as usize).saturating_sub(used);
         if fill > 0 {
             line.push_span(Span::raw(" ".repeat(fill)));
@@ -896,6 +1135,9 @@ pub fn render_rows(
                     ctx.icons, th, 0, "Inbox", *collapsed, *count, None, narrow, marker,
                 )
             }
+            Row::Archived { count, collapsed } => folder_line(
+                ctx.icons, th, 0, "Archived", *collapsed, *count, None, narrow,
+            ),
             Row::Machine {
                 name,
                 host,
@@ -906,7 +1148,20 @@ pub fn render_rows(
                 key,
                 depth,
                 meta_idx,
-            } => session_line(ctx, key, *meta_idx, *depth, narrow, area.width as usize),
+                auto_archived,
+            } => {
+                let mut line =
+                    session_line(ctx, key, *meta_idx, *depth, narrow, area.width as usize);
+                if *auto_archived {
+                    // The smart archive de-emphasizes the whole row, not just
+                    // the title: agent mark, custom color, metadata and any
+                    // activity badge all collapse to the theme's dim tone.
+                    for span in &mut line.spans {
+                        span.style = span.style.fg(th.dim);
+                    }
+                }
+                line
+            }
             Row::Empty { depth, .. } => Line::from(vec![Span::styled(
                 format!("{}(empty — n: new session here)", "  ".repeat(*depth + 1)),
                 Style::new().fg(th.dim).add_modifier(Modifier::ITALIC),
@@ -923,7 +1178,7 @@ pub fn render_rows(
             };
             // Pad to the full row width so the highlight is a bar across
             // the pane, not a box hugging the text.
-            let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            let used = line.width();
             let fill = (area.width as usize).saturating_sub(used);
             if fill > 0 {
                 line.push_span(Span::raw(" ".repeat(fill)));
@@ -1055,13 +1310,136 @@ mod tests {
             false,
             None,
         );
-        // + new session, spacer, folder(work) + s1, then Inbox(1) + s2
+        // + new session, spacer, folder(work) + s1, spacer, Inbox(1) + s2
         assert!(matches!(rows[0], Row::NewSession));
         assert!(matches!(rows[1], Row::Spacer));
         assert!(matches!(&rows[2], Row::Folder { name, .. } if name == "work"));
         assert!(matches!(&rows[3], Row::Session { key, .. } if key.id == "aaa"));
-        assert!(matches!(rows[4], Row::Inbox { count: 1, .. }));
-        assert!(matches!(&rows[5], Row::Session { key, .. } if key.id == "bbb"));
+        assert!(matches!(rows[4], Row::Spacer));
+        assert!(matches!(rows[5], Row::Inbox { count: 1, .. }));
+        assert!(matches!(&rows[6], Row::Session { key, .. } if key.id == "bbb"));
+    }
+
+    #[test]
+    fn inactive_inbox_sessions_move_to_the_default_collapsed_archive() {
+        let now = DateTime::parse_from_rfc3339("2026-07-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut st = VagState::default();
+        let mut old = meta(AgentKind::Claude, "old", "old");
+        old.last_activity = Some(now - chrono::Duration::days(3) - chrono::Duration::seconds(1));
+        let mut boundary = meta(AgentKind::Claude, "boundary", "boundary");
+        boundary.last_activity = Some(now - chrono::Duration::days(3));
+        let unknown = meta(AgentKind::Claude, "unknown", "unknown");
+        let mut future = meta(AgentKind::Claude, "future", "future");
+        future.last_activity = Some(now + chrono::Duration::hours(1));
+        let mut reopened = meta(AgentKind::Claude, "reopened", "reopened");
+        reopened.last_activity = Some(now - chrono::Duration::days(30));
+        st.session_mut(&reopened.key).last_opened = Some(now - chrono::Duration::hours(1));
+        let mut pinned = meta(AgentKind::Claude, "pinned", "pinned");
+        pinned.last_activity = Some(now - chrono::Duration::days(30));
+        let pinned_keys = HashSet::from([pinned.key.clone()]);
+        let sessions = vec![old.clone(), boundary, unknown, future, reopened, pinned];
+        let collapsed = HashSet::from([ARCHIVED_ID.to_string()]);
+
+        let rows = build_rows_at(
+            &st,
+            &sessions,
+            &[],
+            &[],
+            &collapsed,
+            None,
+            false,
+            false,
+            None,
+            &pinned_keys,
+            now,
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Inbox {
+                count: 5,
+                collapsed: false
+            }
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Archived {
+                count: 1,
+                collapsed: true
+            }
+        )));
+        assert!(
+            rows.iter().all(|row| row.session_key() != Some(&old.key)),
+            "collapsed archive hides its children: {rows:?}"
+        );
+
+        let rows = build_rows_at(
+            &st,
+            &sessions,
+            &[],
+            &[],
+            &HashSet::new(),
+            None,
+            false,
+            false,
+            None,
+            &pinned_keys,
+            now,
+        );
+        let archived = rows
+            .iter()
+            .position(|row| matches!(row, Row::Archived { .. }))
+            .unwrap();
+        assert!(matches!(
+            &rows[archived + 1],
+            Row::Session { key, auto_archived: true, .. } if key == &old.key
+        ));
+    }
+
+    #[test]
+    fn automatic_archive_only_partitions_real_inbox_candidates() {
+        let now = DateTime::parse_from_rfc3339("2026-07-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut st = VagState::default();
+        let folder = st.create_folder("work", None).unwrap();
+        let mut foldered = meta(AgentKind::Claude, "foldered", "foldered");
+        foldered.last_activity = Some(now - chrono::Duration::days(10));
+        st.set_session_folder(&foldered.key, Some(&folder)).unwrap();
+        let mut remote = meta(AgentKind::Claude, "remote", "remote");
+        remote.last_activity = Some(now - chrono::Duration::days(10));
+        st.session_mut(&remote.key).remote = Some("gpu".into());
+        let mut dangling = meta(AgentKind::Claude, "dangling", "dangling");
+        dangling.last_activity = Some(now - chrono::Duration::days(10));
+        st.session_mut(&dangling.key).folder = Some("deleted-folder".into());
+        let sessions = vec![foldered.clone(), remote.clone(), dangling.clone()];
+
+        let rows = build_rows_at(
+            &st,
+            &sessions,
+            &[],
+            &[("gpu".into(), "gpu.example".into())],
+            &HashSet::new(),
+            None,
+            false,
+            false,
+            None,
+            &HashSet::new(),
+            now,
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Session { key, auto_archived: false, .. } if key == &foldered.key
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Session { key, auto_archived: false, .. } if key == &remote.key
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Session { key, auto_archived: true, .. } if key == &dangling.key
+        )));
     }
 
     #[test]
@@ -1093,6 +1471,114 @@ mod tests {
         collapsed.insert(fid.clone());
         let rows = build_rows(&st, &[], &[], &[], &collapsed, None, false, false, None);
         assert!(!rows.iter().any(|r| matches!(r, Row::Empty { .. })));
+    }
+
+    #[test]
+    fn collapsed_top_level_folder_siblings_stay_compact() {
+        let mut st = VagState::default();
+        let first = st.create_folder("alpha", None).unwrap();
+        let second = st.create_folder("beta", None).unwrap();
+        let collapsed = HashSet::from([first, second]);
+
+        let rows = build_rows(&st, &[], &[], &[], &collapsed, None, false, false, None);
+
+        assert!(matches!(&rows[2], Row::Folder { name, .. } if name == "alpha"));
+        assert!(matches!(&rows[3], Row::Folder { name, .. } if name == "beta"));
+        assert!(!matches!(rows.last(), Some(Row::Spacer)));
+    }
+
+    #[test]
+    fn expanded_folder_spacing_belongs_to_its_last_visible_child() {
+        let mut st = VagState::default();
+        let first = st.create_folder("alpha", None).unwrap();
+        let second = st.create_folder("beta", None).unwrap();
+        let member = meta(AgentKind::Claude, "aaa", "alpha child");
+        st.set_session_folder(&member.key, Some(&first)).unwrap();
+        let collapsed = HashSet::from([second]);
+
+        let rows = build_rows(
+            &st,
+            &[member],
+            &[],
+            &[],
+            &collapsed,
+            None,
+            false,
+            false,
+            None,
+        );
+
+        assert!(matches!(&rows[2], Row::Folder { name, .. } if name == "alpha"));
+        assert!(matches!(&rows[3], Row::Session { key, .. } if key.id == "aaa"));
+        assert!(matches!(rows[4], Row::Spacer));
+        assert!(matches!(&rows[5], Row::Folder { name, .. } if name == "beta"));
+        assert!(!matches!(rows.last(), Some(Row::Spacer)));
+    }
+
+    #[test]
+    fn inbox_archive_spacing_follows_inbox_children() {
+        let now = DateTime::parse_from_rfc3339("2026-07-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut recent = meta(AgentKind::Claude, "recent", "recent");
+        recent.last_activity = Some(now - chrono::Duration::hours(1));
+        let mut old = meta(AgentKind::Claude, "old", "old");
+        old.last_activity = Some(now - chrono::Duration::days(4));
+        let sessions = [recent, old];
+
+        let both_collapsed = HashSet::from([INBOX_ID.to_string(), ARCHIVED_ID.to_string()]);
+        let rows = build_rows_at(
+            &VagState::default(),
+            &sessions,
+            &[],
+            &[],
+            &both_collapsed,
+            None,
+            false,
+            false,
+            None,
+            &HashSet::new(),
+            now,
+        );
+        assert!(matches!(
+            rows[2],
+            Row::Inbox {
+                collapsed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rows[3],
+            Row::Archived {
+                collapsed: true,
+                ..
+            }
+        ));
+
+        let archive_collapsed = HashSet::from([ARCHIVED_ID.to_string()]);
+        let rows = build_rows_at(
+            &VagState::default(),
+            &sessions,
+            &[],
+            &[],
+            &archive_collapsed,
+            None,
+            false,
+            false,
+            None,
+            &HashSet::new(),
+            now,
+        );
+        assert!(matches!(
+            rows[2],
+            Row::Inbox {
+                collapsed: false,
+                ..
+            }
+        ));
+        assert!(matches!(&rows[3], Row::Session { key, .. } if key.id == "recent"));
+        assert!(matches!(rows[4], Row::Spacer));
+        assert!(matches!(rows[5], Row::Archived { .. }));
     }
 
     #[test]
@@ -1212,7 +1698,7 @@ mod tests {
         let rows = build_rows(
             &st,
             &sessions,
-            std::slice::from_ref(&pending),
+            &[(pending.clone(), None)],
             &[],
             &HashSet::new(),
             Some("auth"),
@@ -1416,10 +1902,11 @@ mod tests {
     fn provisional_rows_render_before_inbox_sessions() {
         let st = VagState::default();
         let prov = SessionKey::new(AgentKind::Claude, "pending-xyz");
+        let sessions = vec![meta(AgentKind::Codex, "scanned", "already scanned")];
         let rows = build_rows(
             &st,
-            &[],
-            std::slice::from_ref(&prov),
+            &sessions,
+            &[(prov.clone(), None)],
             &[],
             &HashSet::new(),
             None,
@@ -1428,8 +1915,91 @@ mod tests {
             None,
         );
         assert!(matches!(rows[0], Row::NewSession));
-        assert!(matches!(rows[2], Row::Inbox { count: 1, .. }));
+        assert!(matches!(rows[2], Row::Inbox { count: 2, .. }));
         assert!(matches!(&rows[3], Row::Session { key, meta_idx: None, .. } if *key == prov));
+        assert!(
+            matches!(&rows[4], Row::Session { key, meta_idx: Some(0), .. } if key.id == "scanned")
+        );
+    }
+
+    #[test]
+    fn resolved_meta_less_row_honors_persisted_folder() {
+        let mut st = VagState::default();
+        let fid = st.create_folder("work", None).unwrap();
+        let resolved = SessionKey::new(AgentKind::Codex, "real-id-no-rollout-yet");
+        st.set_session_folder(&resolved, Some(&fid)).unwrap();
+        let intended = st.session(&resolved).and_then(|r| r.folder.clone());
+
+        let rows = build_rows(
+            &st,
+            &[],
+            &[(resolved.clone(), intended.clone())],
+            &[],
+            &HashSet::new(),
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(matches!(
+            &rows[2],
+            Row::Folder { id, session_count: 1, .. } if id == &fid
+        ));
+        assert!(matches!(
+            &rows[3],
+            Row::Session { key, meta_idx: None, depth: 1, .. } if key == &resolved
+        ));
+        assert!(
+            !rows.iter().any(|row| matches!(row, Row::Inbox { .. })),
+            "foldered meta-less row must not be duplicated in Inbox: {rows:?}"
+        );
+
+        // Collapsing the destination hides its child but still counts it.
+        let rows = build_rows(
+            &st,
+            &[],
+            &[(resolved, intended)],
+            &[],
+            &HashSet::from([fid.clone()]),
+            None,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(
+            &rows[2],
+            Row::Folder { id, session_count: 1, collapsed: true, .. } if id == &fid
+        ));
+    }
+
+    #[test]
+    fn pending_meta_less_row_honors_requested_folder_without_state_entry() {
+        let mut st = VagState::default();
+        let fid = st.create_folder("launch-here", None).unwrap();
+        let pending = SessionKey::new(AgentKind::Codex, "pending-new");
+        assert!(st.session(&pending).is_none());
+
+        let rows = build_rows(
+            &st,
+            &[],
+            &[(pending.clone(), Some(fid.clone()))],
+            &[],
+            &HashSet::new(),
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(matches!(
+            &rows[2],
+            Row::Folder { id, session_count: 1, .. } if id == &fid
+        ));
+        assert!(matches!(
+            &rows[3],
+            Row::Session { key, meta_idx: None, depth: 1, .. } if key == &pending
+        ));
+        assert!(!rows.iter().any(|row| matches!(row, Row::Inbox { .. })));
     }
 
     fn machines(names: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1458,11 +2028,13 @@ mod tests {
             false,
             None,
         );
-        // + new session, spacer, folder + aaa, machine(gpu), Inbox + bbb
+        // Expanded content owns the larger boundary; the empty machine and
+        // following Inbox headers remain compactly adjacent.
         assert!(matches!(rows[0], Row::NewSession));
         assert!(matches!(&rows[2], Row::Folder { name, .. } if name == "work"));
         assert!(matches!(&rows[3], Row::Session { key, .. } if key.id == "aaa"));
-        match &rows[4] {
+        assert!(matches!(rows[4], Row::Spacer));
+        match &rows[5] {
             Row::Machine {
                 name,
                 host,
@@ -1476,8 +2048,8 @@ mod tests {
             }
             other => panic!("expected machine row, got {other:?}"),
         }
-        assert!(matches!(rows[5], Row::Inbox { count: 1, .. }));
-        assert!(matches!(&rows[6], Row::Session { key, .. } if key.id == "bbb"));
+        assert!(matches!(rows[6], Row::Inbox { count: 1, .. }));
+        assert!(matches!(&rows[7], Row::Session { key, .. } if key.id == "bbb"));
 
         // …and the empty group survives repo scoping (scope-exempt).
         let scope = PathBuf::from("/repo");
@@ -1531,7 +2103,7 @@ mod tests {
         assert_eq!(ids, vec!["fff", "rrr", "ooo"], "folder, machine, inbox");
         assert!(matches!(&rows[2], Row::Folder { name, .. } if name == "work"));
         assert!(
-            matches!(&rows[4], Row::Machine { name, count: 1, .. } if name == "gpu"),
+            matches!(&rows[5], Row::Machine { name, count: 1, .. } if name == "gpu"),
             "foldered remote not double-counted: {rows:?}"
         );
         assert_eq!(
@@ -1631,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn provisional_labels_replace_the_starting_placeholder() {
+    fn provisional_labels_replace_the_neutral_session_fallback() {
         let mut st = VagState::default();
         let key = SessionKey::new(AgentKind::Shell, "shell-abc123");
         let resolved = SessionKey::new(AgentKind::Codex, "real-id");
@@ -1654,10 +2226,11 @@ mod tests {
         let t = line_text(&session_line(&ctx, &key, None, 1, false, 80));
         assert!(t.contains("shell @ gpu"), "{t:?}");
         assert!(t.starts_with("    $ "), "shell glyph leads: {t:?}");
-        // unlabelled provisional rows keep the historical placeholder
+        // An unlabelled provisional row is usable, so it gets a neutral
+        // title rather than looking permanently stuck in startup.
         let other = SessionKey::new(AgentKind::Codex, "pending-xyz");
         let t = line_text(&session_line(&ctx, &other, None, 1, false, 80));
-        assert!(t.contains("(starting…)"), "{t:?}");
+        assert!(t.contains("codex session"), "{t:?}");
         let t = line_text(&session_line(&ctx, &resolved, None, 1, false, 80));
         assert!(t.contains("named early"), "{t:?}");
         let unnamed = SessionKey::new(AgentKind::Codex, "real-unnamed");
@@ -1737,6 +2310,14 @@ mod tests {
         assert_eq!(Badge::Idle.glyph(&Icons::ASCII).0, "◌");
         assert_eq!(Badge::Exited.glyph(&Icons::ASCII).0, "✚");
         assert_eq!(Badge::External.glyph(&Icons::ASCII).0, "▲");
+        assert_eq!(
+            Badge::NeedsInput(NeedsInputKind::Approval).glyph(&Icons::ASCII),
+            ("!", Color::Yellow)
+        );
+        assert_eq!(
+            Badge::NeedsInput(NeedsInputKind::Question).glyph(&Icons::ASCII),
+            ("?", Color::Magenta)
+        );
         assert_eq!(Badge::None.glyph(&Icons::NERD).0, "");
         assert_eq!(Badge::DoneUnread.glyph(&Icons::NERD).0, "\u{F0E0}");
         assert_eq!(Badge::Exited.glyph(&Icons::NERD).0, "\u{F068C}");
@@ -1837,6 +2418,7 @@ mod tests {
             BadgeInfo {
                 kind: Badge::Working,
                 dur: Some(std::time::Duration::from_secs(41)),
+                unread: false,
             },
         );
         let labels = HashMap::new();
@@ -1855,8 +2437,142 @@ mod tests {
         let l = session_line(&ctx, &sessions[0].key, Some(0), 0, true, 34);
         let text = line_text(&l);
         assert!(
-            text.contains(&format!("{} 41s", SPINNER[0])),
-            "glyph and duration need a gap: {text:?}"
+            text.contains(&format!("{} working 41s", SPINNER[0])),
+            "narrow status needs an explicit label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn native_attention_badge_is_reason_aware_and_non_animated() {
+        let st = VagState::default();
+        let sessions = vec![meta(AgentKind::Claude, "aaa", "one")];
+        let mut badges = HashMap::new();
+        badges.insert(
+            sessions[0].key.clone(),
+            BadgeInfo {
+                kind: Badge::NeedsInput(NeedsInputKind::Approval),
+                dur: Some(std::time::Duration::from_secs(41)),
+                unread: true,
+            },
+        );
+        let labels = HashMap::new();
+        let ctx = RowCtx {
+            state: &st,
+            sessions: &sessions,
+            badges: &badges,
+            now: Utc::now(),
+            active: None,
+            open_order: &[],
+            spin_frame: 7,
+            icons: &Icons::ASCII,
+            provisional_labels: &labels,
+            theme: Theme::TRANSPARENT,
+        };
+
+        let wide = session_line(&ctx, &sessions[0].key, Some(0), 0, false, 80);
+        let text = line_text(&wide);
+        assert!(text.contains("! approval needed 41s"), "{text:?}");
+        assert!(
+            wide.spans.iter().any(|span| {
+                span.content == "one" && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "unread native attention bolds the title"
+        );
+
+        let narrow = session_line(&ctx, &sessions[0].key, Some(0), 0, true, 34);
+        let text = line_text(&narrow);
+        assert!(text.contains("! approval 41s"), "{text:?}");
+        assert!(
+            !SPINNER.iter().any(|spinner| text.contains(spinner)),
+            "waiting indicators never animate: {text:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_status_owns_its_width_before_numbered_wide_title() {
+        let st = VagState::default();
+        let sessions = vec![meta(
+            AgentKind::Codex,
+            "aaa",
+            "你好你好 — a very long session title",
+        )];
+        let key = sessions[0].key.clone();
+        let mut badges = HashMap::new();
+        badges.insert(
+            key.clone(),
+            BadgeInfo {
+                kind: Badge::NeedsInput(NeedsInputKind::Input),
+                dur: Some(std::time::Duration::from_secs(65)),
+                unread: true,
+            },
+        );
+        let labels = HashMap::new();
+        let open_order = vec![key.clone()];
+        let ctx = RowCtx {
+            state: &st,
+            sessions: &sessions,
+            badges: &badges,
+            now: Utc::now(),
+            active: Some(&key),
+            open_order: &open_order,
+            spin_frame: 0,
+            icons: &Icons::NERD,
+            provisional_labels: &labels,
+            theme: Theme::NIGHT,
+        };
+
+        let line = session_line(&ctx, &key, Some(0), 1, true, 34);
+        let text = line_text(&line);
+        assert!(line.width() <= 34, "row exceeds sidebar: {text:?}");
+        assert!(
+            text.ends_with("? input 1m05s"),
+            "title/shortcut must never clip the status: {text:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_active_session_has_a_left_attached_rail() {
+        let st = VagState::default();
+        let sessions = vec![
+            meta(AgentKind::Claude, "aaa", "active"),
+            meta(AgentKind::Claude, "bbb", "other"),
+        ];
+        let badges = HashMap::new();
+        let labels = HashMap::new();
+        let active = sessions[0].key.clone();
+        let ctx = RowCtx {
+            state: &st,
+            sessions: &sessions,
+            badges: &badges,
+            now: Utc::now(),
+            active: Some(&active),
+            open_order: &[],
+            spin_frame: 0,
+            icons: &Icons::ASCII,
+            provisional_labels: &labels,
+            theme: Theme::NIGHT,
+        };
+
+        let attached = session_line(&ctx, &sessions[0].key, Some(0), 1, true, 34);
+        assert!(
+            line_text(&attached).starts_with("▌   ✳ active"),
+            "attached row gets the left rail: {:?}",
+            line_text(&attached)
+        );
+        assert_eq!(attached.spans[0].style.fg, Some(Theme::NIGHT.accent));
+
+        let other = session_line(&ctx, &sessions[1].key, Some(1), 1, true, 34);
+        assert!(
+            line_text(&other).starts_with("    ✳ other"),
+            "inactive rows keep their existing alignment: {:?}",
+            line_text(&other)
+        );
+
+        let wide = session_line(&ctx, &sessions[0].key, Some(0), 1, false, 80);
+        assert!(
+            line_text(&wide).starts_with("    ✳ active"),
+            "the attached rail is sidebar-only: {:?}",
+            line_text(&wide)
         );
     }
 
@@ -1895,6 +2611,7 @@ mod tests {
                 key: m.key.clone(),
                 depth: 0,
                 meta_idx: Some(i),
+                auto_archived: false,
             })
             .collect();
         let backend = ratatui::backend::TestBackend::new(40, 10);
@@ -1965,6 +2682,7 @@ mod tests {
             key: sessions[0].key.clone(),
             depth: 0,
             meta_idx: Some(0),
+            auto_archived: false,
         }];
         let sel = Theme::NIGHT.sel;
         let backend = ratatui::backend::TestBackend::new(40, 3);
@@ -1987,6 +2705,60 @@ mod tests {
             .find(|&x| buf[(x, 0)].symbol() == "✳")
             .expect("agent icon rendered");
         assert_eq!(buf[(icon_x, 0)].fg, Color::LightYellow);
+    }
+
+    #[test]
+    fn automatic_archive_dims_the_entire_session_row() {
+        let mut st = VagState::default();
+        let sessions = vec![meta(AgentKind::Claude, "aaa", "one")];
+        st.session_mut(&sessions[0].key).color = Some("red".into());
+        let mut badges = HashMap::new();
+        badges.insert(
+            sessions[0].key.clone(),
+            BadgeInfo {
+                kind: Badge::Working,
+                dur: Some(std::time::Duration::from_secs(41)),
+                unread: false,
+            },
+        );
+        let labels = HashMap::new();
+        let ctx = RowCtx {
+            state: &st,
+            sessions: &sessions,
+            badges: &badges,
+            now: Utc::now(),
+            active: None,
+            open_order: &[],
+            spin_frame: 0,
+            icons: &Icons::ASCII,
+            provisional_labels: &labels,
+            theme: Theme::NIGHT,
+        };
+        let rows = vec![Row::Session {
+            key: sessions[0].key.clone(),
+            depth: 0,
+            meta_idx: Some(0),
+            auto_archived: true,
+        }];
+        let backend = ratatui::backend::TestBackend::new(80, 2);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            render_rows(f, Rect::new(0, 0, 80, 2), &rows, 0, &ctx, false, true);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(2, 0)].symbol(), "✳");
+        assert_eq!(buf[(2, 0)].fg, Theme::NIGHT.dim, "agent mark is dim");
+        assert_eq!(buf[(4, 0)].symbol(), "o");
+        assert_eq!(
+            buf[(4, 0)].fg,
+            Theme::NIGHT.dim,
+            "custom title color is dim"
+        );
+        let badge_x = (0..80)
+            .find(|&x| buf[(x, 0)].symbol() == SPINNER[0])
+            .expect("working badge rendered");
+        assert_eq!(buf[(badge_x, 0)].fg, Theme::NIGHT.dim, "badge is dim");
     }
 
     #[test]
