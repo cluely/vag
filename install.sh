@@ -1,17 +1,16 @@
 #!/bin/sh
-# vag installer — https://github.com/OWNER/vag
+# vag installer — https://github.com/cluely/vag
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/vag/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/cluely/vag/main/install.sh | sh
 #
 # Downloads the latest release binary for your platform, or builds from
 # source with cargo when no prebuilt binary matches. Installs to
 # /usr/local/bin (or ~/.local/bin without write access; override with
 # VAG_INSTALL_DIR).
 #
-# NOTE: OWNER is a placeholder until the repository is published.
 set -eu
 
-REPO="${VAG_REPO:-OWNER/vag}"
+REPO="${VAG_REPO:-cluely/vag}"
 INSTALL_DIR="${VAG_INSTALL_DIR:-}"
 
 say()  { printf '\033[1;36mvag\033[0m %s\n' "$*"; }

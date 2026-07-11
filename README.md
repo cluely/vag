@@ -2,7 +2,6 @@
 
 **One keyboard-driven dashboard for every Claude Code and Codex session on your machine.**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/OWNER/vag/ci.yml?branch=main)](https://github.com/OWNER/vag/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
@@ -38,16 +37,16 @@ Prefer full-width sessions? The floating tree (`ui.tree = "float"`) overlays on 
 
 ## Install
 
-**Homebrew** — *not published yet, coming soon* (the formula lives in [`Formula/vag.rb`](Formula/vag.rb)):
+**Homebrew** (formula source: [`Formula/vag.rb`](Formula/vag.rb)):
 
 ```sh
-brew install OWNER/vag/vag
+brew install cluely/vag/vag
 ```
 
 **curl** (downloads a release binary, falls back to a cargo build — script is [`install.sh`](install.sh)):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/vag/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cluely/vag/main/install.sh | sh
 ```
 
 **From source** (requires Rust):
@@ -63,8 +62,6 @@ vag drives the real agent CLIs — install at least one of
 Those two CLIs are the only requirement: everything else (including the fuzzy
 directory picker in the new-session flow) is built into the `vag` binary — no
 `fzf` or other external tools needed.
-
-*`OWNER` is a placeholder for the GitHub org/user until the repository is published.*
 
 ## Quickstart
 
