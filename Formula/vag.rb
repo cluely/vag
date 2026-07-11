@@ -9,7 +9,7 @@ class Vag < Formula
   desc "Keyboard-driven organizer that embeds your Claude Code & Codex sessions"
   homepage "https://github.com/cluely/vag"
   url "https://github.com/cluely/vag/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
+  sha256 "2fac2b77bb6073bfab3a52dca435985011233c9f20344eea4340e6cdba43e258"
   license "MIT"
   head "https://github.com/cluely/vag.git", branch: "main"
 
