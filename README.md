@@ -21,20 +21,24 @@
   <a href="#development">Development</a>
 </p>
 
-```text
-┌─ vag ─────────────────────┬──────────────────────────────────┐
-│   + new session           │ ✳ Claude Code                    │
-│ ▾ work/                   │                                  │
-│   ⠹ auth-fix    working 4m│ > fix the flaky auth test        │
-│   ● parser-v2   done 2m   │   ⏺ Running tests…               │
-│ ▸ experiments/            │                                  │
-│                           │   the real agent TUI, running     │
-│ n:new F:fork e:edit ?:help│   in an embedded terminal pane   │
-└───────────────────────────┴──────────────────────────────────┘
-```
+<p align="center">
+  <a href="assets/CleanShot%202026-07-11%20at%2000.58.55@2x.png">
+    <img src="assets/CleanShot%202026-07-11%20at%2000.58.55@2x.png" alt="vag dashboard with a Codex session open beside the session tree" width="100%">
+  </a>
+</p>
 
-_Illustrative split view; exact chrome depends on the theme, tree mode, and
-terminal width._
+<p align="center"><sub>Dashboard and embedded agent UI</sub></p>
+
+<p align="center">
+  <a href="assets/CleanShot%202026-07-11%20at%2000.59.17@2x.png">
+    <img src="assets/CleanShot%202026-07-11%20at%2000.59.17@2x.png" alt="vag session-scoped diff view in the sidebar layout" width="49%">
+  </a>
+  <a href="assets/CleanShot%202026-07-11%20at%2001.00.41@2x.png">
+    <img src="assets/CleanShot%202026-07-11%20at%2001.00.41@2x.png" alt="vag diff view and embedded Codex effort picker using a cyan theme" width="49%">
+  </a>
+</p>
+
+<p align="center"><sub>Session-scoped diffs · themes and native agent controls</sub></p>
 
 `vag` puts your coding-agent sessions in one terminal workspace. Open a
 session in the real agent UI, detach to the dashboard while it keeps running,
