@@ -1,454 +1,503 @@
-# vag
+<h1 align="center">vag</h1>
 
-**One keyboard-driven dashboard for every Claude Code and Codex session on your machine.**
+<p align="center">
+  <strong>One keyboard-driven dashboard for every Claude Code and Codex session on your machine.</strong>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+<p align="center">
+  <a href="https://github.com/cluely/vag/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cluely/vag?style=flat-square&label=release"></a>
+  <a href="https://github.com/cluely/vag/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square"></a>
+  <img alt="macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg?style=flat-square">
+  <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-dea584.svg?style=flat-square&logo=rust">
+</p>
 
-vag is **not a replacement** for Claude Code or Codex — it's an expansion. It launches
-the **real** `claude` and `codex` CLIs and embeds them in a terminal pane, so everything
-those tools do keeps working (including features shipped after vag), and adds
-organization, turn tracking, and navigation on top. Think lazygit for your agent sessions.
+<p align="center">
+  <a href="#installation">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#workflows">Workflows</a> ·
+  <a href="#cli-reference">CLI</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#limitations">Limitations</a> ·
+  <a href="#development">Development</a>
+</p>
 
-```
+```text
 ┌─ vag ─────────────────────┬──────────────────────────────────┐
 │   + new session           │ ✳ Claude Code                    │
 │ ▾ work/                   │                                  │
 │   ⠹ auth-fix    working 4m│ > fix the flaky auth test        │
 │   ● parser-v2   done 2m   │   ⏺ Running tests…               │
 │ ▸ experiments/            │                                  │
-│                           │ (the actual claude TUI, rendered │
-│ n:new F:fork e:edit ?:help│  in an embedded terminal pane)   │
+│                           │   the real agent TUI, running     │
+│ n:new F:fork e:edit ?:help│   in an embedded terminal pane   │
 └───────────────────────────┴──────────────────────────────────┘
 ```
 
-Prefer full-width sessions? The floating tree (`ui.tree = "float"`) overlays on demand:
+_Illustrative split view; exact chrome depends on the theme, tree mode, and
+terminal width._
 
-```
-┌─ vag ────────────────────────────────────────────────────────┐
-│ > codex is refactoring, full width…                          │
-│         ┌─ sessions ──────────────────────┐                  │
-│         │ ▾ work/                         │                  │
-│         │   ⠹ auth-fix        working 4m  │                  │
-│         │   ● parser-v2       done 2m     │                  │
-│         └─────────────────────────────────┘                  │
-└──────────────────────────────────────────────────────────────┘
-```
+`vag` puts your coding-agent sessions in one terminal workspace. Open a
+session in the real agent UI, detach to the dashboard while it keeps running,
+see which turns need attention, and inspect the working-tree diff associated
+with each session.
 
-## Install
+It does not replace or reimplement either agent. `vag` launches your installed
+`claude` and `codex` binaries in PTYs and keeps its folders, colors, and activity
+metadata separate from their session stores. Think
+[lazygit](https://github.com/jesseduffield/lazygit) for agent sessions.
 
-**Homebrew** (formula source: [`Formula/vag.rb`](Formula/vag.rb)):
+## Highlights
+
+- **One tree for every session** — discover Claude Code and Codex sessions
+  automatically, group them into folders, filter them, or scope the view to the
+  current Git repository. Agent session files are scanned read-only and never
+  moved.
+- **The real agent UI** — run the installed CLIs in embedded terminal panes.
+  Detach to the dashboard, return later, keep several sessions open, or zoom one
+  to the full terminal.
+- **Attention at a glance** — see when a session is working, done, waiting for
+  approval, waiting for input, idle, or exited. Native agent events are used
+  when available, with PTY and transcript activity as fallbacks.
+- **Session-scoped diffs** — press `D` to review the live diff for files a
+  session touched. Use the built-in renderer or your existing
+  [delta](https://github.com/dandavison/delta) setup.
+- **Organize at terminal speed** — create sessions with a built-in fuzzy
+  directory picker, or press `e` and edit the whole session tree as an
+  [oil.nvim](https://github.com/stevearc/oil.nvim)-style text buffer.
+- **Activity without inflated timers** — dashboard cards and a calendar heatmap
+  record genuine streaming-output time, excluding idle time and approval waits.
+- **Local and remote** — mix Claude, Codex, local shells, and SSH machines in the
+  same dashboard.
+- **Batteries included** — themes, mouse support, Nerd Font icons, a floating-tree
+  layout, and in-app settings ship in one binary. The fuzzy finder is built in;
+  `fzf` is not required.
+
+## Installation
+
+`vag` supports macOS and Linux on `x86_64` and `aarch64`. Install at least one
+of [Claude Code](https://code.claude.com) or
+[Codex](https://developers.openai.com/codex) first.
+
+### Homebrew
 
 ```sh
 brew install cluely/vag/vag
 ```
 
-**curl** (downloads a release binary, falls back to a cargo build — script is [`install.sh`](install.sh)):
+The Homebrew formula also installs `git-delta` for richer diff rendering.
+
+### Install script
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/cluely/vag/main/install.sh | sh
 ```
 
-**From source** (requires Rust):
+The script downloads a release binary when one is available and otherwise
+builds from source with Cargo. The fallback requires a current stable Rust
+toolchain. Set `VAG_INSTALL_DIR` to choose the destination.
+
+### Cargo
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/cluely/vag
 ```
 
-vag drives the real agent CLIs — install at least one of
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) or
-[Codex](https://github.com/openai/codex), then run `vag doctor`.
+Building from source requires a current stable Rust toolchain. Git is used for
+repository scoping and diffs; `delta` and SSH are optional.
 
-Those two CLIs are the only requirement: everything else (including the fuzzy
-directory picker in the new-session flow) is built into the `vag` binary — no
-`fzf` or other external tools needed.
-
-## Quickstart
+After installing, check the setup:
 
 ```sh
-vag        # dashboard of every claude/codex session on this machine
+vag doctor
 ```
 
-`enter` opens the session under the cursor (the real CLI, embedded). `ctrl-q` detaches
-back to the tree — the agent keeps working. `?` shows every key.
+## Quick start
 
-## Features
+Start `vag` inside a repository to see that project's sessions, or anywhere
+else to see every discovered session:
 
-- **Dashboard of everything** — every Claude Code and Codex session, discovered read-only
-  from the CLIs' own stores (`~/.claude`, `~/.codex`), grouped into **folders you define**.
-  Session files are **never moved or edited** — organization lives in vag's own state
-  file, so resume always works and agent CLI updates can't break your layout.
-- **Automatic archive** — unfiled Inbox sessions with no activity for more than three
-  days move into a built-in, collapsed **Archived** group and render dimmed. Opening or
-  externally running sessions stay in Inbox; this smart group is separate from Codex's
-  native `A` archive command and never changes an agent's store.
-- **The real CLIs, embedded** — opening a session runs the actual `claude --resume` /
-  `codex resume` in a PTY and renders it in a pane. Inside the pane every key goes to the
-  agent — including `ctrl-c` — except the detach hotkey.
-- **Session lifecycle** — create (either agent, any directory — picked with a built-in
-  fzf-style fuzzy finder), fork (`--fork-session` / `codex fork`), rename, hide,
-  archive (codex-native).
-- **Turn tracking** — switch away mid-turn and the tree shows what every session is doing:
-  `⠹ working 4m32s` (animated) while a command is in flight, a bold `● done 2m` when a
-  turn completed while you were away (cleared when viewed), `◌` idle, `✚` exited,
-  and `▲ working 3m` for claude sessions running in *other* terminals (detected via
-  transcript activity). Sessions launched by vag also use agent-native attention events:
-  local Claude sessions get session-scoped post-fact hooks for approvals, elicitations, and
-  an idle composer, and submitted/resumed prompts start the in-flight clock immediately;
-  Codex's native TUI notifications report completion, approvals, and plan prompts through
-  bounded OSC 9 messages, including over SSH. Vag never edits persisted agent settings to
-  enable this. Narrow rows reserve the full status (`done`, `approval`, `input`, etc.) before
-  truncating the session title. The live `working` timer is elapsed in-flight time; dashboard
-  agent totals remain a separate fresh-output activity metric so approval/user waits do not
-  inflate history.
-  The PTY activity tracker remains the fallback for custom wrappers, disabled hooks, remote
-  Claude, and external sessions. Timestamps refresh live.
-- **Per-session diff view** — every open session has a second tab: `D` (tree) or
-  `ctrl-g` (pane) flips between the live agent and a GitHub-style diff of what *that*
-  agent changed — a collapsible file tree (per-filetype icons in nerd mode) on the left,
-  the full diff on the right. The diff is live `git diff` against the commit that was
-  HEAD when vag first opened the session, scoped to the files the agent's own transcript
-  says it edited (`a` widens to the whole repo, `B` re-anchors the base to now). It
-  refreshes in real time: on every completed turn, whenever the transcript records a new
-  edit, and on a slow fallback that catches shell-made changes.
-  The body renders through **[delta](https://github.com/dandavison/delta)** when it's on
-  your PATH — syntax highlighting, word-level diffs, and your own delta config (themes,
-  `side-by-side`, `line-numbers`) apply as-is; without delta, vag's builtin renderer
-  (unified, line-number gutters) takes over. `brew install git-delta` to get the full
-  experience (the vag Homebrew formula pulls it in automatically); opt out or tune it
-  via `[diff]` in the config.
-- **Repo scoping** — launched inside a git repo, vag shows only that repo's sessions and
-  folders by default (`g` toggles the cross-project view). A pinned `+ new session` row
-  defaults new sessions to the repo root.
-- **Zoom** (`z`) — hand the whole terminal to the session for full fidelity, one hotkey back.
-- **Agent detection** — agents missing from PATH appear grayed out in the new-session
-  picker; `vag doctor` reports exactly what was found.
-- **In-app settings** (`⚙` pinned at the bottom of the tree; `End` jumps to it) —
-  themes with **live preview**,
-  icons, pane style, tree mode, launch behavior, and fully rebindable keys; every
-  change applies instantly and is saved to `config.toml` (see [Settings](#settings)).
-
-### Edit mode (oil.nvim-style)
-
-Press `e` in the tree (dashboard, sidebar, or floating tree) to turn it into an editable
-text buffer, [oil.nvim](https://github.com/stevearc/oil.nvim)-style: reorganize sessions
-by editing lines, then `:w` to review and apply the changes as one batch.
-
-- **Vim subset** — Normal: `h j k l` (+arrows), `0 $ gg G`, counts for `j`/`k`,
-  `i a I A` enter Insert, `x`, `dd` (cut line), `yy` (yank), `p`/`P` (paste below/above),
-  `o`/`O` (open line), `u` / `ctrl-r` (undo/redo). Cmdline: `:w`, `:q`, `:q!`, `:wq`.
-  `enter` on a session line opens it (only when the buffer has no unsaved changes).
-- **Editing a line renames** the session or folder (folders keep a trailing `/`).
-  Deleting all of a session's text resets its name to the agent's default.
-- **`dd` + `p` moves** a session (paste on a folder line drops it *inside* that folder);
-  `dd` without a re-paste **hides** the session; `dd` on a folder line **deletes** the
-  folder (contents re-parent).
-- **Fork by copy-paste**: `yy` a session line and `p`aste it somewhere — on `:w` the
-  duplicate becomes a **fork** of the session into the paste location's folder.
-- **`o` then a name ending in `/`** creates a folder there; other typed text is ignored
-  with a warning (sessions can't be typed into existence).
-- `:w` shows the planned actions in a confirm box before anything is applied; `:q`
-  refuses to leave with unsaved changes (`:q!` forces). While editing, every key —
-  including the detach key — goes to the buffer, so `:q` is the only way out.
-
-### Floating tree
-
-With `ui.tree = "float"` a session takes the full width and the detach key (default
-`ctrl-q`) toggles a centered floating tree over it — press it again (or `esc`) to close,
-`b` to return to the full dashboard, and `e` inside the float to edit. The default
-`"sidebar"` keeps the persistent left sidebar.
-
-### Remote (SSH) sessions
-
-Machines are dashboard groups. Press `R` inside vag (or run
-`vag remote add gpu-box user@host`) to add one; `n` on a machine creates a session there,
-and `s` opens a plain shell on it — or a local `$SHELL` anywhere else — so shells and
-agent sessions mix in one dashboard. The real agent CLI runs over `ssh -t` inside the
-same embedded pane, so the first connection's password and host-key prompts just work —
-vag never stores credentials, it rides your `~/.ssh/config` (the host field accepts your
-ssh aliases, and the add-machine dialog suggests them). Turn tracking comes along. Remote
-claude sessions get a pre-assigned session id, so they persist and reopen from vag like
-local ones; remote codex sessions are attach-only for now (they stay resumable on the box
-itself). Remote rows carry an `@host` label in the tree.
-
-## CLI commands
-
-`vag doctor` — check agent CLIs, stores, vag's own files, and the reachability of any
-configured `[[remotes]]`:
-
+```sh
+cd ~/code/my-project
+vag
 ```
-  claude  ✓ claude  (2.1.197 (Claude Code))
-  codex   ✓ codex  (codex-cli 0.142.5)
-  claude store   /Users/guigaribaldi/.claude (163 sessions)
-  codex store    /Users/guigaribaldi/.codex (59 sessions)
-  config         /Users/guigaribaldi/.config/vag/config.toml  (missing — defaults active)
-  state          /Users/guigaribaldi/.local/share/vag/state.json  (0 folders, 1 tracked sessions)
-```
-
-`vag list [--json]` — print every discovered session (`--json` for machines):
-
-```
-claude  39212683 Build vag CLI aggregator for Claude sessions       vibe-aggregator      29s
-claude  da90a1ec voice lab                                          passport-ts          1h
-```
-
-`vag config` — print file locations and the fully resolved configuration:
-
-```
-config file:  /Users/guigaribaldi/.config/vag/config.toml
-state file:   /Users/guigaribaldi/.local/share/vag/state.json
-resolved configuration:
-[keys]
-detach = "ctrl-q"
-```
-
-`vag remote add <name> <host> [--dir <d>]` / `vag remote list` / `vag remote remove <name>`
-— manage the `[[remotes]]` SSH machines without opening the config.
-
-`vag --icons <nerd|ascii|auto>` — per-run icon set override for the TUI (also `VAG_ICONS=nerd`).
-
-`vag --tree <sidebar|float>` / `vag --float` — per-run tree placement (also `VAG_TREE=float`).
-
-`vag --pane <border|titlebar>` — pane chrome (default: tmux-style titlebar; also `VAG_PANE=border`).
-
-`vag --theme <night|mocha|gruvbox|transparent>` — color theme (default: `night`, a solid
-dark background; `transparent` keeps the terminal's own background — the pre-theme look).
-The agent pane joins the theme: the embedded emulator answers claude/codex's color
-queries with the theme's pane colors, so agents render palettes that match.
-The titlebar shows the session's context live: project (or `@machine`), git branch,
-turn state (`working 4m12s` / `done 2m`), and creation time — dropping the least
-important pieces first on narrow terminals.
-
-`vag --edit` — start the tree in nvim edit mode for this run (also `VAG_EDIT=1`).
-
-## Settings
-
-The `⚙ settings` row is pinned at the **bottom** of the tree — outside the scrolling
-list, so it never takes a slot from your sessions and stays visible however long the
-tree gets — and shows its shortcut: `settings (,)`. Press `,` to open the page from
-anywhere in the tree, or `End` (or `j` past the last row) then `enter`. The page covers: theme,
-icons, pane style, tree mode, sidebar width, launch behavior — and every key
-binding. Changes apply **immediately** and are written to `config.toml` for you
-(comments and formatting in the file survive). The theme row opens a picker that
-**previews live** as you move over the options: `enter` keeps the hovered theme,
-`esc` puts the old one back. On a key row, `enter` waits for the next keypress to
-rebind (navigation keys — `j/k/h/l`, space, `/`, digits — are reserved and refused;
-so is a char another action already holds).
-
-Per-run flags (`--theme`, `--icons`, …) still win at launch over whatever is saved.
-
-## Configuration
-
-Create `~/.config/vag/config.toml` (`XDG_CONFIG_HOME` respected). Every key is optional —
-any key you set overrides the default. The settings page writes this same file, so
-you never *have* to edit it by hand. These are the defaults:
-
-```toml
-[keys]
-detach = "ctrl-q"               # pane -> tree (double press sends the literal chord through)
-toggle_sidebar = "ctrl-e"       # show/hide the sidebar while a session pane has focus
-focus_tree = "ctrl-h"           # pane -> tree (plain alias, no double-press escape hatch)
-focus_pane = "ctrl-l"           # tree -> the active session's pane (not "enter" — never
-                                 # opens the row under the cursor)
-# every single-char command is rebindable (defaults shown; one printable,
-# non-reserved char each — j/k/h/l, space, `/` and digits are navigation):
-quit = "q"
-help = "?"
-new_session = "n"
-new_folder = "N"
-fork = "F"
-edit = "e"
-move = "m"
-rename = "r"
-add_machine = "R"
-shell = "s"
-bind_dir = "b"
-color = "c"
-hide = "d"
-show_hidden = "H"
-scope = "g"
-archive = "A"
-delete = "x"
-close = "w"
-zoom = "z"
-diff = "D"
-settings = ","
-toggle_diff = "ctrl-g"          # pane -> the session's diff view and back
-
-[agents.claude]
-command = "claude"              # binary name or path
-extra_args = []                 # appended to every spawn of this agent
-
-[agents.codex]
-command = "codex"               # binary name or path
-extra_args = []                 # appended to every spawn of this agent
-
-[ui]
-sidebar_width = 34              # columns for the session tree
-tree = "sidebar"                # or "float": full-width pane, detach key toggles a floating tree
-pane = "titlebar"               # tmux-style full-width title bar (default); or
-                                # "border": a bordered box (per run: vag --pane border)
-theme = "night"                 # solid dark background (default). Also: "mocha",
-                                # "gruvbox", "dracula", "nord", "onedark", "solarized",
-                                # "rose-pine", or "transparent" (terminal shows through).
-                                # ALL tree text (folders, project labels, timestamps)
-                                # follows the theme's palette. Switch live from the
-                                # settings page (previews as you move); per run:
-                                # vag --theme <name> or VAG_THEME
-                                # The sidebar/dashboard tree paints its own shade
-                                # (sidebar_bg), distinct per theme, so split view
-                                # reads as two panels instead of one flat surface.
-# [theme]                       # fine-tune any key over the named base:
-# bg = "#1a1b26"                # app background
-# surface = "#24283b"           # bars / raised rows
-# sidebar_bg = "#1f2231"        # tree/sidebar panel — distinct from the pane bg
-# sel = "#3b4261"               # cursor-row highlight (tree + pickers)
-# accent = "cyan"               # highlights: folders, buttons (names or #rrggbb)
-# info = "#7dcfff"              # secondary accent: project labels, machine names
-# dim = "#565f89"               # hints, timestamps
-# pane_fg = "#c0caf5"           # agent pane defaults — also answered to the
-# pane_bg = "#1a1b26"           # agents' OSC theme queries so their colors match
-icons = "ascii"                 # or "nerd" | "auto" — auto detects common nerd-font terminals;
-                                # per run: `vag --icons nerd` or VAG_ICONS=nerd
-edit_default = false            # start the tree in vim edit mode
-mouse = true                    # wheel scrolls the pane's scrollback (or the tree);
-                                # clicking a pane focuses it; children that enable mouse
-                                # reporting (claude) get the events forwarded. Costs the
-                                # terminal's native drag-selection — hold Shift to select,
-                                # or turn this off (also toggleable from settings)
-
-[diff]
-use_delta = true                # render diff bodies through `delta` when it's on PATH
-                                # (syntax highlighting + your own delta/git config);
-                                # false — or delta missing — uses vag's builtin renderer
-delta_args = []                 # extra delta flags, appended last (they win), e.g.
-                                # ["--side-by-side"] or ["--syntax-theme", "GitHub"]
-
-[behavior]
-repo_scope = true               # scope to the current git repo by default when inside one (g toggles)
-show_hidden = false             # show hidden sessions
-codex_show_automation = false   # show codex automation threads
-# claude_config_dir = "/path/to/.claude"   # store override; $CLAUDE_CONFIG_DIR works without config
-# codex_home = "/path/to/.codex"           # store override; $CODEX_HOME works without config
-
-# [[remotes]]                   # SSH machines sessions can be created on; none by default
-# name = "gpu-box"              # shown in the UI
-# host = "user@10.0.0.5"        # anything `ssh` accepts (incl. config aliases)
-# default_dir = "~/work"        # optional: prefill for new sessions
-# claude_command = "claude"     # optional: binary path on the remote
-# codex_command = "codex"
-```
-
-The `R` dialog and `vag remote add` write the `[[remotes]]` section for you.
-
-Folder organization lives in `~/.local/share/vag/state.json` (`XDG_DATA_HOME` respected) —
-written atomically and never touched by the agent CLIs.
-
-## Keys
-
-Defaults — every single-letter command (and every ctrl chord below) is rebindable
-from the settings page (or the `[keys]` table); navigation keys are fixed.
 
 | Key | Action |
 |---|---|
-| `j`/`k`, arrows | move |
-| `enter` | open session / toggle folder / open settings (top row) |
-| `tab` | switch focus tree ⇄ pane |
-| `h` / `l` | collapse folder / focus pane |
-| `ctrl-q` | detach from pane back to the tree (twice quickly = send literal ctrl-q) |
-| `ctrl-e` | toggle the sidebar's visibility while a session pane has focus (view-only — doesn't change `ui.tree`) |
-| `ctrl-h` | focus the tree from the pane (plain alias for `ctrl-q`, no double-press escape hatch) |
-| `ctrl-l` | focus the active session's pane from the tree — unlike `enter`, never opens/activates the row under the cursor |
-| `esc` | clear filter / back to full dashboard (sessions keep running) |
-| `n` / `N` | new session / new folder |
-| `F` | fork session |
-| `s` | open a shell — local `$SHELL` here, or `ssh` on the selected machine |
-| `R` | add a machine (SSH remote) |
-| `e` | edit the tree as a buffer (vim keys — see Edit mode) |
-| `m` | move session to folder |
-| `r` | rename session or folder |
-| `b` | bind a default directory to a folder / back to dashboard |
-| `c` | set a session's accent color (tints its tree row and titlebar) |
-| `d` | hide/unhide session |
-| `H` | show hidden/archived sessions (dimmed) — press `d` on one to unhide |
-| `g` | toggle git-repo scope (on by default inside a repo) |
-| `A` | archive/unarchive (codex sessions, via `codex archive`) |
-| `x` | delete folder / machine / session — codex sessions are truly deleted via `codex delete`; claude sessions are removed from the list (claude has no delete command); remote ones are dropped from vag only |
-| `w` | close a session's process |
-| `space` | collapse folder |
-| `z` | zoom the active session full-screen |
-| `D` / `ctrl-g` | switch the session's tab: agent ⇄ **diff view** (what it changed). `ctrl-g` works from the sidebar, the agent pane, and the diff view alike, always landing in the pane. Inside the diff: `j`/`k` scroll, `ctrl-d`/`ctrl-u` half-page and `ctrl-f`/`ctrl-b`/pgup/pgdn full-page (vim-style), `tab` file-tree ⇄ diff, `enter` jump to file, `space` collapse dir, `g`/`G` top/bottom, `a` agent-files ⇄ whole repo, `r` refresh, `B` re-anchor base to HEAD, `ctrl-e` sidebar, `esc` back to the agent |
-| `1..9` | jump to open session |
-| `,` | open settings |
-| `end` | jump to the pinned `⚙ settings` row |
-| `pgup`/`pgdn` | scroll the active pane's scrollback — works from tree focus AND pane focus (pane focus: intercepted only while the child is on the primary screen, so alt-screen apps like `vim` or codex's `ctrl+t` transcript overlay still get the keys; shift/ctrl-modified PgUp always reaches the child) |
-| mouse wheel | scroll whatever is under the pointer: pane scrollback (arrow keys are sent instead when the child is on the alt screen) or the tree. `ui.mouse = false` disables all mouse handling. While scrolled back, the titlebar shows `scroll ↑N`; any keypress snaps back to live |
-| `/` | filter |
-| `?` | help |
-| `q` | quit |
+| `enter` | Open or resume the selected session |
+| `n` | Create a session |
+| `ctrl-q` | Detach from the agent pane to the tree |
+| `D` in the tree / `ctrl-g` anywhere | Toggle the active session's diff |
+| `e` | Edit the session tree as a text buffer |
+| `/` | Filter sessions |
+| `z` | Zoom the active session |
+| `,` | Open settings |
+| `?` | Show the full in-app keymap |
+| `q` | Quit |
 
-### Mouse in tmux
+> [!IMPORTANT]
+> Sessions keep running while you move around inside `vag`, but `vag` is not a
+> daemon. Quitting it ends the processes it launched.
 
-No configuration needed: vag requests mouse reporting from its host terminal, and tmux
-forwards mouse events to a pane whose program asked for them — with `mouse on` its default
-wheel binding sends through (`#{mouse_any_flag}`), with `mouse off` the modes pass through
-directly. Native text selection inside vag needs Shift+drag either way (or `ui.mouse = false`).
+## Workflows
 
-### tmux (vim-tmux-navigator users)
+### Run several agents without losing the thread
 
-If your tmux binds `C-h`/`C-l` to `select-pane` (the vim-tmux-navigator setup), tmux
-swallows those keys before vag sees them — the same reason the plugin special-cases vim.
-Add `vag` to the pass-through detection in your `~/.tmux.conf`:
+Press `n`, choose Claude or Codex, and pick a working directory with the
+built-in fuzzy finder. While the agent works, press `ctrl-q` to return to the
+tree and open another session. The row status updates live:
+
+| Status | Meaning |
+|---|---|
+| `⠹ working 4m` | A turn is in flight |
+| `● done 2m` | A turn completed while the session was out of view |
+| `approval` / `input` | The agent needs attention |
+| `◌ idle` | The session is ready |
+| `✚ exited` | The child process ended |
+| `▲ working 3m` | A Claude session is active in another terminal |
+
+Unfiled Inbox sessions with no activity for more than three days move into a
+collapsed **Archived** smart group. This only changes the dashboard view; it
+does not edit either agent's store.
+
+### Review a session's working-tree diff
+
+Press `D` from the tree or `ctrl-g` from a pane. `vag` shows a collapsible file
+tree beside a live diff anchored to the commit that was `HEAD` when the session
+first opened.
+
+By default, the diff is limited to files the agent's transcript says it
+touched. Press `a` to widen it to the whole repository, `B` to re-anchor the
+base to the current `HEAD`, or `r` to refresh. If `delta` is on `PATH`, its
+syntax themes, line numbers, and side-by-side settings apply automatically;
+otherwise `vag` uses its built-in unified renderer.
+
+### Organize sessions by editing text
+
+Press `e` in any tree to enter edit mode. Rename a session by editing its line,
+move it with `dd` and `p`, create a folder with `o` and a trailing `/`, or copy
+and paste a session to fork it. `:w` previews the actions before applying them.
+
+<details>
+<summary><strong>Edit mode reference</strong></summary>
+
+- Normal mode: `h j k l`, arrows, `0`, `$`, `gg`, `G`, and counts for `j`/`k`.
+- Enter Insert mode with `i`, `a`, `I`, or `A`.
+- Edit with `x`, `dd`, `yy`, `p`, `P`, `o`, `O`, `u`, and `ctrl-r`.
+- Save or leave with `:w`, `:q`, `:q!`, or `:wq`.
+- Editing a line renames the session or folder. Folders keep a trailing `/`.
+- `dd` then `p` moves a session; pasting on a folder drops it inside.
+- Deleting a session line hides it. Deleting a folder re-parents its contents.
+- `yy` then `p` duplicates a session as a fork.
+- `o` followed by a name ending in `/` creates a folder.
+- `enter` opens a session only when the buffer has no unsaved changes.
+
+</details>
+
+### Work across machines
+
+Add an SSH machine from the UI with `R`, or from the shell:
+
+```sh
+vag remote add gpu-box user@host --dir '~/work'
+```
+
+Press `n` on a machine to create an agent session there, or `s` to open a plain
+shell. Connections use your normal `ssh` command and `~/.ssh/config`; `vag`
+does not store credentials.
+
+Remote Claude sessions created by `vag` persist and can be reopened from the
+dashboard. A remote Codex session works only while its original `vag` pane is
+open; after that, resume it on the remote machine with `codex resume` because
+`vag` cannot reattach it yet.
+
+### Choose a layout
+
+The default sidebar keeps the session tree beside the active agent. Floating
+mode gives the agent the full width and opens the tree as an overlay when you
+press the detach key:
+
+```sh
+vag --float
+```
+
+Use `b` from the floating tree to return to the full dashboard, or `e` to edit
+the overlay directly.
+
+## Keybindings
+
+Press `?` inside `vag` for the contextual keymap. Dashboard command bindings
+and its five control chords are rebindable from the settings page or
+`config.toml`; navigation and view-specific scrolling keys stay fixed.
+
+<details>
+<summary><strong>Default keymap overview</strong></summary>
+
+| Key | Action |
+|---|---|
+| `j` / `k`, arrows | Move |
+| `enter` | Open session, toggle folder, or activate settings |
+| `tab` | Focus the pane from the tree; inside a pane, Tab goes to the child |
+| `h` / `l` | Collapse folder / focus pane |
+| `ctrl-q` | Detach to the tree; press twice quickly to send a literal `ctrl-q` |
+| `ctrl-e` | Show or hide the sidebar while a pane has focus |
+| `ctrl-h` / `ctrl-l` | Focus tree / focus active pane |
+| `esc` | Clear filter, close the floating tree, or return to the dashboard |
+| `n` / `N` | New session / new folder |
+| `F` | Fork session |
+| `s` | Open a local or remote shell |
+| `R` | Add an SSH machine |
+| `e` | Edit the tree as a buffer |
+| `m` | Move session to a folder |
+| `r` | Rename session or folder |
+| `b` | Bind a default directory to a folder / return to dashboard |
+| `c` | Set a session accent color |
+| `d` | Hide or unhide session |
+| `H` | Show hidden and archived sessions |
+| `g` | Toggle current-repository scope |
+| `A` | Archive or unarchive a Codex session with the Codex CLI |
+| `x` | Remove the selected folder, machine, or session; behavior is provider-specific |
+| `w` | Close a session process |
+| `space` | Collapse or expand a folder |
+| `z` | Zoom the active session |
+| `D` in the tree / `ctrl-g` in any view | Toggle the active session's agent and diff tabs |
+| `1`…`9` | Jump to an open session |
+| `,` | Open settings |
+| `end` | Jump to the bottom-pinned settings row |
+| `pgup` / `pgdn` | Scroll pane history |
+| Mouse wheel | Scroll the tree or pane under the pointer |
+| `/` | Filter |
+| `?` | Help |
+| `q` | Quit |
+
+`x` permanently deletes a local Codex session through the Codex CLI. It hides
+a local Claude session, removes a remote session only from `vag`, and removes a
+machine's configuration without deleting data on that machine.
+
+Diff view adds these controls:
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Scroll |
+| `ctrl-d` / `ctrl-u` | Scroll half a page |
+| `ctrl-f` / `ctrl-b`, `pgup` / `pgdn` | Scroll a full page |
+| `tab` | Switch between the file tree and diff |
+| `enter` | Jump to the selected file |
+| `space` | Collapse or expand a directory |
+| `g` / `G` | Jump to top / bottom |
+| `a` | Toggle agent-touched files / whole repository |
+| `r` | Refresh |
+| `B` | Re-anchor the base to current `HEAD` |
+| `esc` | Return to the agent pane |
+
+</details>
+
+## CLI reference
+
+| Command | Purpose |
+|---|---|
+| `vag` | Open the dashboard |
+| `vag doctor` | Check agent CLIs, stores, local files, and configured remotes |
+| `vag list [--json]` | List discovered sessions |
+| `vag config` | Print file locations and resolved configuration |
+| `vag remote add <name> <host> [--dir <path>]` | Add an SSH machine |
+| `vag remote list` | List configured SSH machines |
+| `vag remote remove <name>` | Remove an SSH machine |
+| `vag --help` / `vag --version` | Print help / version |
+
+Per-run UI overrides:
+
+```text
+--icons <ascii|nerd|auto>
+--tree <sidebar|float>
+--float
+--pane <titlebar|border>
+--theme <name>
+--edit
+```
+
+## Configuration
+
+The settings row is pinned at the bottom of the tree. Press `,` to open it and
+change the theme, icons, pane style, tree mode, sidebar width, launch behavior,
+or any rebindable key. Changes preview live and are written without discarding
+comments in the config file.
+
+For manual configuration, create
+`~/.config/vag/config.toml` (`XDG_CONFIG_HOME` is respected). Every field is
+optional:
+
+```toml
+[ui]
+theme = "mocha"          # night, mocha, gruvbox, dracula, nord, onedark,
+                         # solarized, rose-pine, or transparent
+tree = "float"           # sidebar or float
+pane = "titlebar"        # titlebar or border
+icons = "auto"           # ascii, nerd, or auto
+sidebar_width = 38
+mouse = true
+edit_default = false
+
+[keys]
+detach = "ctrl-q"
+toggle_sidebar = "ctrl-e"
+focus_tree = "ctrl-h"
+focus_pane = "ctrl-l"
+toggle_diff = "ctrl-g"
+new_session = "n"
+diff = "D"
+settings = ","
+
+[agents.claude]
+command = "claude"
+extra_args = []
+
+[agents.codex]
+command = "codex"
+extra_args = []
+
+[diff]
+use_delta = true
+delta_args = []           # for example: ["--side-by-side"]
+
+[behavior]
+repo_scope = true
+show_hidden = false
+codex_show_automation = false
+```
+
+Override individual theme colors with `red`, `orange`, `yellow`, `green`,
+`cyan`, `blue`, `magenta`, `pink`, or a `#rrggbb` value:
+
+```toml
+[theme]
+bg = "#1a1b26"
+fg = "#c0caf5"
+surface = "#24283b"
+sidebar_bg = "#1f2231"
+sel = "#3b4261"
+dim = "#565f89"
+accent = "cyan"
+info = "#7dcfff"
+pane_fg = "#c0caf5"
+pane_bg = "#1a1b26"
+```
+
+Set `pane_fg` and `pane_bg` together, using hex colors, to override the embedded
+terminal palette.
+
+Remotes can also be declared directly:
+
+```toml
+[[remotes]]
+name = "gpu-box"
+host = "user@example.com"
+default_dir = "~/work"
+# claude_command = "claude"
+# codex_command = "codex"
+```
+
+Configuration and local state live at:
+
+| Data | Default path |
+|---|---|
+| Configuration | `~/.config/vag/config.toml` |
+| Folder and session metadata | `~/.local/share/vag/state.json` |
+| Activity totals and heatmap | `~/.local/share/vag/activity_stats.json` |
+
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` change those roots. Folder organization
+and activity stats are written atomically. Discovery reads agent stores without
+writing to them; explicit Codex archive and delete requests are delegated to
+the native Codex CLI.
+
+Flags take precedence over the file. The equivalent environment overrides are
+`VAG_ICONS`, `VAG_TREE`, `VAG_PANE`, `VAG_THEME`, and `VAG_EDIT`. Native
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` overrides are also respected.
+
+## Terminal integration
+
+Mouse support works in tmux without additional configuration. Because terminal
+mouse reporting takes over drag events, hold Shift while dragging to select
+text, or set `ui.mouse = false`.
+
+<details>
+<summary><strong>vim-tmux-navigator setup</strong></summary>
+
+If tmux binds `C-h` and `C-l` to `select-pane`, it consumes those keys before
+`vag` sees them. Add `vag` to the plugin's pass-through check and place these
+bindings after the plugin line:
 
 ```tmux
-# vim-tmux-navigator's is_vim check, with vag added alongside vim/fzf:
 is_vim="ps -o state= -o comm= -t '#{pane_tty}' | grep -iqE '^[^TXZ ]+ +(\\S+\\/)?g?(view|l?n?vim?x?|fzf|vag)(diff)?$'"
 bind-key -n 'C-h' if-shell "$is_vim" 'send-keys C-h' 'select-pane -L'
 bind-key -n 'C-l' if-shell "$is_vim" 'send-keys C-l' 'select-pane -R'
 ```
 
-(If you load the plugin via TPM, define these two bindings *after* the plugin line so
-they win, or patch the plugin's `is_vim` variable the same way.)
+When `ctrl-h` is pressed with the tree already focused, `vag` forwards the move
+left to tmux. It forwards `ctrl-l` to the right only when there is no active
+session to focus; inside an active agent pane, `ctrl-l` reaches the child.
 
-vag speaks the navigator protocol back: when a focus key runs off vag's edge —
-`ctrl-h` with the tree already focused, or `ctrl-l` with no session to focus — vag
-forwards the motion to `tmux select-pane -L`/`-R`, so `C-h`/`C-l` walk seamlessly
-across your tmux panes, vag's tree, and the embedded session as one continuum,
-exactly like vim splits do. Outside tmux the edge presses are quiet no-ops. One
-deliberate exception: `ctrl-l` while the *session pane* has focus is forwarded to
-the agent (it's clear-screen in shells), not to tmux.
-
-## Notes & limitations (v1)
-
-- The embedded pane advertises a standard xterm-256color surface. Kitty-keyboard-protocol
-  keys (e.g. claude's shift+enter) aren't forwarded — use `\` + enter, or zoom (`z`) in a
-  kitty-capable terminal. Sync output (DEC 2026), theme queries (OSC 10/11), DA1/DSR are
-  fully handled — claude and codex render flicker-free.
-- Sessions end when vag exits (no daemon). `q` asks for confirmation if agents are running.
-- Claude Code has no per-session delete CLI, so `d` hides sessions at the vag level;
-  codex `A` uses the real `codex archive` so its own index stays consistent.
-- Both CLIs' storage formats are officially internal; vag parses defensively and treats
-  its scan as read-only, but a CLI update can temporarily blank titles until a fix.
-- Remote codex sessions are attach-only from vag (still resumable on the box itself), and
-  forking isn't available on remotes yet.
+</details>
 
 ## How it works
 
-Each open session is a real CLI process on a PTY; its output feeds
-[alacritty_terminal](https://crates.io/crates/alacritty_terminal)'s emulator, and the
-resulting grid is drawn as a [ratatui](https://ratatui.rs) pane. Keyboard input reaches
-the agent as raw bytes — vag intercepts exactly one chord, the detach key. See `PLAN.md`
-for the full architecture.
+Each open session is a real CLI process running on a PTY. Its output is fed to
+[`alacritty_terminal`](https://crates.io/crates/alacritty_terminal), then the
+emulated grid is rendered by [`ratatui`](https://ratatui.rs). Input stays as raw
+terminal bytes; `vag` handles only its configured navigation, scrolling, and
+view shortcuts around the child process.
+
+Discovery is defensive because both agents' on-disk formats are internal. A
+failed backend produces a warning instead of taking down the other agent or the
+dashboard.
+
+## Limitations
+
+- `vag` has no daemon. Quitting ends the sessions it launched.
+- The embedded pane exposes an xterm-256color surface. Kitty keyboard protocol
+  sequences are not forwarded, so use an agent's alternate binding or zoom with
+  `z` when a key depends on that protocol.
+- Claude Code has no per-session delete command. `vag` can hide Claude sessions;
+  Codex archive and delete actions use the native Codex CLI.
+- Claude and Codex storage formats are internal. A CLI update may require a
+  compatibility fix even though discovery is read-only and defensive.
+- Remote Codex sessions cannot be reattached from `vag`; after the original
+  pane closes, resume them on the remote machine. Remote sessions also cannot
+  currently be forked from `vag`.
 
 ## Development
 
 ```sh
-cargo test                       # 244+ unit tests (tempdir fixtures, no real data)
-cargo test -- --ignored          # opt-in: read-only smoke against your real stores
-cargo run --example spike -- -- claude   # fidelity harness: real CLI in a pane
-cargo run --example spike -- --headless 10 -- codex   # headless grid dump
+git clone https://github.com/cluely/vag.git
+cd vag
+cargo test
+cargo run
 ```
+
+Read-only smoke tests against the agent stores on your machine are opt-in:
+
+```sh
+cargo test -- --ignored
+```
+
+The terminal fidelity harness can run an agent in isolation or dump its
+headless terminal grid:
+
+```sh
+cargo run --example spike -- -- claude
+cargo run --example spike -- --headless 10 -- codex
+```
+
+Issues and pull requests are welcome. Please run `cargo test` before submitting
+a change.
+
+## Inspiration
+
+`vag` borrows interaction ideas from tools that make complicated terminal
+workflows feel direct: [lazygit](https://github.com/jesseduffield/lazygit),
+[`fzf`](https://github.com/junegunn/fzf),
+[`oil.nvim`](https://github.com/stevearc/oil.nvim), and
+[Neovim](https://github.com/neovim/neovim).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © 2026 Guilherme Garibaldi
